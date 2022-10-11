@@ -73,7 +73,7 @@ c21l.run()
 mosaic_shape = c1e.mosaic_shape
 
 mosaics = [
-    reg.Mosaic(aligner, c1e.mosaic_shape, verbose=True, channels=[0])
+    reg.Mosaic(aligner, c1e.mosaic_shape, verbose=True)
     for aligner in (c1e, c21l)
 ]
 
