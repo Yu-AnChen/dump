@@ -55,7 +55,7 @@ c1r = TileReader(
 )
 c1r.parse()
 
-c1e = reg.EdgeAligner(c1r, verbose=True, filter_sigma=1)
+c1e = reg.EdgeAligner(c1r, verbose=True, filter_sigma=1, max_shift=30)
 c1e.run()
 
 c2r = TileReader(
@@ -67,7 +67,7 @@ c2r = TileReader(
 )
 c2r.parse()
 
-c21l = reg.LayerAligner(c2r, c1e, verbose=True, filter_sigma=1)
+c21l = reg.LayerAligner(c2r, c1e, verbose=True, filter_sigma=1, max_shift=30)
 c21l.run()
 
 mosaic_shape = c1e.mosaic_shape
