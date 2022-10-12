@@ -86,12 +86,12 @@ def main(
         f'No image file found at {img_dir} with specified pattern ({img_pattern})'
     )
 
-    print('Constructing ome-xml')
+    print('\nConstructing ome-xml')
 
     if verbose:
         print('FOVs')
         for idx, (img, info_file) in enumerate(zip(imgs, info_files)):
-            print(f"{idx:04}: {img.name} - {info_file.name}")
+            print(f"  {idx:04}: {img.name} - {info_file.name}")
 
     pixels = [
         construct_ome_pixel(img, info_file, pixel_size, regex_pattern=position_regex_pattern)
@@ -102,11 +102,10 @@ def main(
     omexml.images = [ome_types.model.Image(pixels=p) for p in pixels]
 
     out_path = data_dir / f'{data_dir.name}.companion.ome'
-    print(f"Writing to {out_path}")
+    print(f"Writing to {out_path}\n")
     with open(out_path, 'w') as f:
         f.write(omexml.to_xml())
 
-    print()
     return 0
 
 
