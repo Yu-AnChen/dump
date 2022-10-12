@@ -3,7 +3,7 @@
 brew uninstall qt@5
 
 # install pyqt with conda
-conda create -n qt -c conda-forge python pyqt
+conda create -n qt -c conda-forge python pyqt psutil
 conda activate qt
 
 # instead of `python -m pip install napari[all]`
