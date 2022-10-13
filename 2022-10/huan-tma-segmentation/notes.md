@@ -19,6 +19,7 @@ python watershed.py
     --pixel-size 0.325
 ```
 
+---
 
 params.yml for mcmicro
 
@@ -33,7 +34,7 @@ workflow:
 
 options:
   unmicst: --tool unmicst-duo --scalingFactor 0.5 --mean 0.05 --std 0.05
-  s3seg: --maxima-footprint-size 9 --area-max 50000 --mean-intensity-min 80 --expand-size 6
+  s3seg: --maxima-footprint-size 9 --area-max 50000 --mean-intensity-min 80 --expand-size 6 --pixel-size 0.325
 
 modules:
   watershed:
