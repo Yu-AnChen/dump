@@ -18,3 +18,26 @@ python watershed.py
     --area-max 50000 
     --pixel-size 0.325
 ```
+
+
+params.yml for mcmicro
+
+https://mcmicro.org/parameters/#specifying-an-external-parameter-file
+
+```
+workflow:
+  start-at: segmentation
+  stop-at: segmentation
+  # this is 1-based indexing, use `1 1` for the first channel
+  segmentation-channel: 37 37
+
+options:
+  unmicst: --tool unmicst-duo --scalingFactor 0.5 --mean 0.05 --std 0.05
+  s3seg: --maxima-footprint-size 9 --area-max 50000 --mean-intensity-min 80 --expand-size 6
+
+modules:
+  watershed:
+    name: s3seg
+    container: labsyspharm/s3segmenter
+    version: 1.5.1-large
+```
