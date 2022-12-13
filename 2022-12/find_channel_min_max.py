@@ -155,3 +155,97 @@ def napari_check(img_path, mins, maxs, channel_names=None):
         name=channel_names
     )
     return v
+
+
+import pathlib
+import json
+
+def replace_json_min_max(json_path, mins, maxs, out_path, img_path=None):
+    
+    def replace_min_max(channels):
+        out_channels = list(channels)
+        for c in out_channels:
+            c.update(dict(min=mins[c['id']], max=maxs[c['id']]))
+        return out_channels
+
+    with open(json_path) as f:
+        in_json = json.load(f)
+    
+    for group in in_json['groups']:
+        group['channels'] = replace_min_max(group['channels'])
+        group['render'] = replace_min_max(group['render'])
+    
+    if img_path is not None:
+        in_json['in_file'] = str(img_path)
+
+    with open(out_path, "w") as wf:
+        json.dump(in_json, wf)
+
+json_template_path = pathlib.Path(
+    r'Z:\RareCyte-S3\YC-analysis\minerva-P37_CRC\scripts\orion-template.json'
+)
+channel_names = [
+    'Hoechst', 'AF1', 'CD31', 'CD45', 'CD68', 'Argo550', 'CD4', 'FOXP3', 'CD8a',
+    'CD45RO', 'CD20', 'PD-L1', 'CD3e', 'CD163', 'E-cadherin', 'PD-1', 'Ki67', 'Pan-CK', 'SMA'
+]
+
+files = pd.read_csv(r'Z:\RareCyte-S3\YC-analysis\minerva-P37_CRC\scripts\file_list.csv')
+plot_out_dir = pathlib.Path(r'Z:\RareCyte-S3\YC-analysis\minerva-P37_CRC\scripts\plots-gmm')
+json_out_dir = pathlib.Path(r'Z:\RareCyte-S3\YC-analysis\minerva-P37_CRC\scripts\channel-json')
+
+for n, p in zip(files["name"], files["path"]):
+    img_path = pathlib.Path(p)
+    print('Processing', img_path.name)
+
+    # df1 = level2df(img_path, channel_names=channel_names)
+    # plot(df1, n_components=3)
+    # mins1, maxs1 = get_min_max(df1, n_components=3)
+
+    df2 = biased_patch2df(
+        img_path,
+        channel_names=channel_names,
+        sample_random_state=1001,
+        kwargs_peak_local_max=dict(min_distance=100, num_peaks=20)
+    )
+    
+    plot(df2, n_components=2)
+    fig = plt.gcf()
+    fig.set_size_inches(18, 12)
+    fig.suptitle(f"{img_path.name} (biased GMM)")
+    fig.tight_layout()
+    fig.savefig(plot_out_dir / f"{img_path.stem}-gmm.png", dpi=144)
+
+    mins2, maxs2 = get_min_max(df2, n_components=2, max_percentile=95)
+    mins2 = np.array([m[0] for m in mins2]) / 65535
+    maxs2 = np.array([m[0] for m in maxs2]) / 65535
+
+    replace_json_min_max(
+        json_template_path,
+        mins2, maxs2,
+        json_out_dir / f"{n}.story.json",
+        img_path=img_path.resolve()
+    )
+
+
+    command_dir = pathlib.Path(r'Z:\RareCyte-S3\YC-analysis\minerva-P37_CRC\scripts\pyramid-command')
+    pyramid_cmd = '''
+    python save_exhibit_pyramid.py --force
+    "{}"
+    "{}"
+    "{}"
+    '''
+    minerva_dir = pathlib.Path(r'Z:\RareCyte-S3\YC-analysis\minerva-P37_CRC\orion-crc')
+    pyramid_cmd = pyramid_cmd.format(
+        img_path,
+        json_out_dir / f"{n}.story.json",
+        minerva_dir / n
+    )
+    with open(command_dir / f"{n}-command.txt", 'w') as f:
+        f.write(
+            pyramid_cmd
+            .replace('\n', ' ')
+            .replace('\t', '')
+            .strip()
+        )
+
+    # v2 = napari_check(img_path, [m[0] for m in mins2], [m[0] for m in maxs2], channel_names)
