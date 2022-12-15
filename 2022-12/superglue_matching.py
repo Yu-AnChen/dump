@@ -195,7 +195,7 @@ def plot_match(matching_pred, img_left, img_right, match_mask=None):
     )
     offset = img_left.shape[1]
     fig, ax = plt.subplots()
-    ax.imshow(img)
+    ax.imshow(img, cmap='Greys_r')
     scatter_kwargs = dict(linewidths=0, facecolors='lime', s=4)
     ax.scatter(*kpts0.T, **scatter_kwargs)
     ax.scatter(*(kpts1 + [offset, 0]).T, **scatter_kwargs)
