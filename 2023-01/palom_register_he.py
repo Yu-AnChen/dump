@@ -58,6 +58,6 @@ for mm, r2 in zip(mosaics, c2rs):
     palom.pyramid.write_pyramid(
         mosaics=[mm],
         output_path=out_dir / f"{r2.path.stem}-registered.ome.tif",
-        pixel_size=0.65,
+        pixel_size=0.325,
         channel_names=[list('RBG')]
     )
