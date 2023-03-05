@@ -63,6 +63,53 @@ def edger_bbox_to_edge(mask):
     ])
 
 
+import palom
+
+img_path = '/mnt/orion/Mercury-3/20230227/B6_8EOHXW/segmentation/B6_8EOHXW/nucleiRing.ome.tif'
+reader = palom.reader.OmePyramidReader(img_path)
+mask = reader.pyramid[0][0]
+_all_mask_props = [
+    "label", "centroid", "area",
+]
+full_result = skimage.measure.regionprops_table(np.array(mask), properties=_all_mask_props)
+full_result.keys()
+
+
+edge_size = [dask.delayed(edger_bbox_to_edge)(m) for m in mask.blocks.ravel()]
+with dask.diagnostics.ProgressBar():
+    # FIXME should use process-based parallelization
+    edge_size = dask.compute(*edge_size)
+
+es = np.max([np.max(e) for e in edge_size])
+
+omask = da.overlap.overlap(mask, 48, 'none')
+block_results = [dask.delayed(skimage.measure.regionprops_table)(b, properties=_all_mask_props) for b in omask.blocks.ravel()]
+
+with dask.diagnostics.ProgressBar():
+    # FIXME should use process-based parallelization
+    block_results = dask.compute(*block_results)
+
+import pandas as pd
+
+df_block = (pd.concat([pd.DataFrame(r) for r in block_results])
+    .sort_values(['label', 'area'])
+    .drop_duplicates(keep='last', subset='label')
+    .set_index('label'))
+
+
+df = pd.DataFrame(full_result).set_index('label')
+# compare result
+np.sum(df_block.area != df.area)
+
+
+# use block_info to get offsets for cropping (process parallelization)
+# and apply coordinates offsets
+def test(b, block_info=None):
+    print(block_info[None]['array-location'])
+    return np.atleast_2d(1)
+
+mask.map_blocks(test, dtype=int).compute()
+
 # ---------------------------------------------------------------------------- #
 #                         Next is to monitor RAM usage                         #
 # ---------------------------------------------------------------------------- #
