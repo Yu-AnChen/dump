@@ -31,7 +31,6 @@ p1 = tifffile.imread('/data/run00/in_Probabilities_1.tif')
 p2 = tifffile.imread('/data/run01/in_Probabilities_1.tif')
 abs_diff = np.abs(p1.astype(int)-p2.astype(int))
 print('N different pxs:', np.sum(abs_diff != 0))
-print('N absolute differences >= 1:', np.sum(abs_diff >= 1))
 print('N absolute differences >= 2:', np.sum(abs_diff >= 2))
 print('N absolute differences >= 3:', np.sum(abs_diff >= 3))
 '''
