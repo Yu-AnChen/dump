@@ -12,15 +12,14 @@ def fix_stitcher_ome_xml(
     n_to_replace = ori.count(replace_from)
     if n_to_replace == 0:
         print(f"Substring to be replaced not found in the file ({img_path})")
-        return
+        return 0
     fixed = ori.replace(replace_from, replace_to)
     tifffile.tiffcomment(img_path, fixed.encode())
     print(f"{n_to_replace} instance(s) of {replace_from} replaced with {replace_to}")
-    return
+    return 0
 
 
 def main(argv=sys.argv):
-
     parser = argparse.ArgumentParser(
         description=(
             'Fix invalid ome-xml by string replacement'
@@ -28,34 +27,31 @@ def main(argv=sys.argv):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument(
-        '-i',
-        metavar='input-file',
+        'filepath',
         help='path of input ome-tiff',
-        default=argparse.SUPPRESS,
-        required=True
+        default=argparse.SUPPRESS
     )
     parser.add_argument(
         '-f',
-        metavar='replace-from',
+        metavar='replace-string-from',
         help='String to be replaced',
         default='</Channel><Plane',
         required=False,
     )
     parser.add_argument(
         '-t',
-        metavar='replace-to',
+        metavar='replace-string-to',
         help='New string',
         default='</Channel><MetadataOnly></MetadataOnly><Plane',
         required=False
     )
-
     args = parser.parse_args(argv[1:])
-    return fix_stitcher_ome_xml(args.i, args.f, args.t)
+    return fix_stitcher_ome_xml(args.filepath, args.f, args.t)
 
 
 if __name__ == '__main__':
     sys.exit(main())
     '''
     Example:
-    python fix-ome-xml.py -i input-image.ome.tiff
+    python fix-ome-xml.py input-image.ome.tiff
     '''
