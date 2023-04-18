@@ -1,5 +1,5 @@
 ```bash
-# get qt from homebrew
+# uninstall qt from homebrew
 brew uninstall qt@5
 
 # install pyqt with conda
