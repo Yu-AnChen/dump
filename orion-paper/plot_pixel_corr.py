@@ -120,24 +120,24 @@ orion_ex_group = [1, 1, 2, 2, 5, 4, 4]
 
 markers = [
     'Hoechst',
-    'AF1',
-    'CD31',
-    'CD45',
-    'CD68',
+    'Auto Fluor',
+    'CD31 -515',
+    'CD45 -555L',
+    'CD68 -535',
     '(Empty)',
-    'CD4',
-    'FOXP3',
-    'CD8a',
-    'CD45RO',
-    'CD20',
-    'PD-L1',
-    'CD3e',
-    'CD163',
-    'E-cadherin',
-    'PD-1',
-    'Ki-67',
-    'Pan-CK',
-    'SMA'
+    'CD4 -572',
+    'FOXP3 -584',
+    'CD8a -602',
+    'CD45RO -624',
+    'CD20 -660L',
+    'PD-L1 -662',
+    'CD3e -686',
+    'CD163 -706',
+    'E-cadherin -730',
+    'PD-1 -760',
+    'Ki-67 -795',
+    'Pan-CK -845',
+    'SMA -875'
 ]
 
 
@@ -153,14 +153,15 @@ for fls, r, s in zip(fluors[:], raw_paths[:], sed_paths[:]):
         name = t.name.split('--')[-1].replace('_01_A24.pysed.ome.tif', '')
         ticklabels = heatmap_ticklabel(markers, fls)
         with dask.diagnostics.ProgressBar():
+            plot_data = np.mean(
+                [
+                    np.corrcoef(t[:, 200:-200, 200:-200].reshape(19, -1))
+                    for t in tiles
+                ],
+                axis=0
+            )
             plot_corr(
-                np.mean(
-                    [
-                        np.corrcoef(t[:, 200:-200, 200:-200].reshape(19, -1))
-                        for t in tiles
-                    ],
-                    axis=0
-                ),
+                plot_data,
                 f'{n} - {name}',
                 grouping=orion_ex_group,
                 grouping_colors=colors_rgb,
@@ -171,3 +172,5 @@ for fls, r, s in zip(fluors[:], raw_paths[:], sed_paths[:]):
                 )
             )
             plt.savefig(out_dir / f'{n}-{name}.pdf')
+            # FIXME replace marker names with numbers when no fluo is present
+            pd.DataFrame(plot_data, columns=markers, index=markers).to_csv(out_dir / f'{n}-{name}.csv')
