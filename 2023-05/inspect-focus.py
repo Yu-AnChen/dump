@@ -102,7 +102,8 @@ def process_file(img_path, plot=False, out_dir=None):
             thumbnail_extent_factor=32/128
         )
         fig.suptitle(img_path.stem)
-        fig.savefig(out_dir / f"{img_path.stem}-qc.png", dpi=300)
+        fig.set_size_inches(fig.get_size_inches()*2)
+        fig.savefig(out_dir / f"{img_path.stem}-qc.png", dpi=144, bbox_inches='tight')
 
 
 # ---------------------------------------------------------------------------- #
@@ -226,9 +227,14 @@ def plot_tissue_quality(
     im1 = axs[1].imshow(entropy_img, cmap=cmap)
     im2 = axs[2].imshow(focus_img+1, norm=mcolors.LogNorm(), cmap=cmap)
 
-    contour_tissue = dict(levels=[.5], colors=color_contour_tissue)
-    contour_qc = dict(levels=[.5], colors=color_contour_qc)
+    contour_tissue = dict(levels=[.5], linewidths=1, colors=color_contour_tissue)
+    contour_qc = dict(levels=[.5], linewidths=1, colors=color_contour_qc)
     
+    import skimage.morphology
+
+    entropy_mask = skimage.morphology.remove_small_objects(entropy_mask, 4)
+    qc_mask = skimage.morphology.remove_small_objects(qc_mask, 4)
+
     axs[0].contour(entropy_mask, **contour_tissue)
     axs[0].contour(qc_mask, **contour_qc)
     axs[1].contour(entropy_mask, **contour_tissue)
@@ -306,7 +312,7 @@ def set_matplotlib_font():
     if font_families[0] != 'Arial':
         font_families.insert(0, 'Arial')
     matplotlib.rcParams['pdf.fonttype'] = 42
-    matplotlib.rcParams['font.size'] = 8
+    matplotlib.rcParams['font.size'] = 10
 
 
 # ---------------------------------------------------------------------------- #
