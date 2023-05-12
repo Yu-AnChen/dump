@@ -1,10 +1,11 @@
+import functools
+
+import cv2
+import numpy as np
 import skimage.measure
 import skimage.util
 import tifffile
 from joblib import Parallel, delayed
-import cv2
-import functools
-import numpy as np
 
 
 def shannon_entropy(img, block_size):
@@ -47,10 +48,33 @@ def mean_block(img, block_size):
     return np.mean(wimg, axis=(2, 3))
 
 
+import sklearn.mixture
+
+
+def gmm_cutoffs(var_img, plot=False):
+    gmm = sklearn.mixture.GaussianMixture(n_components=3)
+    limg = np.sort(np.log1p(var_img.flat))
+    labels = gmm.fit_predict(limg.reshape(-1, 1))
+    diff_idxs = np.where(np.diff(labels))
+    diffs = np.mean(
+        (limg[diff_idxs[0]], limg[diff_idxs[0]+1]),
+        axis=0
+    )
+    filtered_diffs = diffs[
+        (diffs > gmm.means_.min()) & (diffs < gmm.means_.max())
+    ]
+    if plot:
+        import matplotlib.pyplot as plt
+        _, ax = plt.subplots()
+        h, *_ = ax.hist(limg, bins=200)
+        ax.vlines(filtered_diffs, 0, h.max(), colors='salmon')
+    return np.expm1(filtered_diffs)
+
+
+import logging
+import pathlib
 
 import skimage.filters
-import pathlib
-import logging
 
 logging.basicConfig( 
     format="%(asctime)s | %(levelname)-8s | %(message)s", 
@@ -74,7 +98,8 @@ def process_file(img_path, plot=False, out_dir=None):
     # qc_img = lvar_img / (mean_block(img, 128)+1)
     # qc_img = np.nan_to_num(qc_img)
     # qc_mask = qc_img > skimage.filters.threshold_triangle(qc_img)
-    qc_mask = lvar_img > skimage.filters.threshold_triangle(lvar_img)
+    # qc_mask = lvar_img > skimage.filters.threshold_triangle(lvar_img)
+    qc_mask = lvar_img >= gmm_cutoffs(lvar_img)[1]
     iou = (tissue_mask & qc_mask).sum() / (tissue_mask | qc_mask).sum()
 
     text = f"""
@@ -101,7 +126,7 @@ def process_file(img_path, plot=False, out_dir=None):
             qc_mask,
             thumbnail_extent_factor=32/128
         )
-        fig.suptitle(img_path.stem)
+        fig.suptitle(img_path.name, y=.90, va='top')
         fig.set_size_inches(fig.get_size_inches()*2)
         fig.savefig(out_dir / f"{img_path.stem}-qc.png", dpi=144, bbox_inches='tight')
 
@@ -109,84 +134,7 @@ def process_file(img_path, plot=False, out_dir=None):
 # ---------------------------------------------------------------------------- #
 #                                 plotting code                                #
 # ---------------------------------------------------------------------------- #
-from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable, Size
-import numpy as np
-
-
-def make_img_axes(
-    ax,
-    num_panels_per_stripe=None,
-    stripe_direction='vertical',
-    axes_class=None, **kwargs
-):  
-    assert stripe_direction in ['vertical', 'horizontal']
-    divider = make_axes_locatable(ax)
-
-    num_stripes = 1
-
-    total_stripe_size = Size.AxesX(ax) if stripe_direction == 'vertical' else Size.AxesY(ax)
-    stripe_sizes = [1/n*total_stripe_size for n in num_panels_per_stripe]
-
-    total_panel_size = Size.AxesY(ax) if stripe_direction == 'vertical' else Size.AxesX(ax)
-    total_panel_grid_size = np.prod(num_panels_per_stripe)
-    unit_panel_size = 1/total_panel_grid_size * total_panel_size
-    panel_sizes = [unit_panel_size]*total_panel_grid_size
-    panel_spans = [int(total_panel_grid_size / n) for n in num_panels_per_stripe]
-
-    if stripe_direction == 'vertical':
-        divider.set_horizontal(stripe_sizes)
-        divider.set_vertical(panel_sizes)
-    else:
-        # start at upper left, flip the vertical sizes
-        divider.set_vertical(stripe_sizes[::-1])
-        divider.set_horizontal(panel_sizes)
-
-    axs = []
-    if axes_class is None:
-        try:
-            axes_class = ax._axes_class
-        except AttributeError:
-            axes_class = type(ax)
-    for stripe_pos, (ns, ps) in enumerate(
-        zip(num_panels_per_stripe, panel_spans)
-    ):
-        for _panel_pos in range(ns):
-            
-            ax1 = axes_class(ax.get_figure(), ax.get_position(original=True),
-                            sharex=ax, sharey=ax, **kwargs)
-            if stripe_pos == _panel_pos == 0:
-                ax1 = ax
-            
-            if stripe_direction == 'vertical':
-                panel_pos = ns - 1 - _panel_pos
-                locator = divider.new_locator(
-                    nx=stripe_pos,
-                    ny=panel_pos*ps, ny1=(panel_pos+1)*ps
-                )
-            else:
-                panel_pos = _panel_pos
-                locator = divider.new_locator(
-                    ny=len(num_panels_per_stripe) - 1 - stripe_pos,
-                    nx=panel_pos*ps, nx1=(panel_pos+1)*ps
-                )
-            
-            ax1.set_axes_locator(locator)
-            
-            for t in ax1.yaxis.get_ticklabels() + ax1.xaxis.get_ticklabels():
-                t.set_visible(False)
-            try:
-                for axis in ax1.axis.values():
-                    axis.major_ticklabels.set_visible(False)
-            except AttributeError:
-                pass
-            
-            axs.append(ax1)
-    
-    fig = ax.get_figure()
-    for ax1 in axs:
-        fig.add_axes(ax1)
-
-    return axs
+from mpl_img_grid import make_img_axes
 
 
 def plot_tissue_quality(
@@ -202,8 +150,8 @@ def plot_tissue_quality(
     stripe_direction='auto',
     plot_colorbar=True
 ):
-    import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
     assert stripe_direction in ['auto', 'horizontal', 'vertical']
@@ -227,18 +175,17 @@ def plot_tissue_quality(
     im1 = axs[1].imshow(entropy_img, cmap=cmap)
     im2 = axs[2].imshow(focus_img+1, norm=mcolors.LogNorm(), cmap=cmap)
 
-    contour_tissue = dict(levels=[.5], linewidths=1, colors=color_contour_tissue)
-    contour_qc = dict(levels=[.5], linewidths=1, colors=color_contour_qc)
+    contour_kwargs = dict(levels=[.5], linewidths=0.5)
     
     import skimage.morphology
 
     entropy_mask = skimage.morphology.remove_small_objects(entropy_mask, 4)
     qc_mask = skimage.morphology.remove_small_objects(qc_mask, 4)
 
-    axs[0].contour(entropy_mask, **contour_tissue)
-    axs[0].contour(qc_mask, **contour_qc)
-    axs[1].contour(entropy_mask, **contour_tissue)
-    axs[2].contour(qc_mask, **contour_qc)
+    axs[0].contour(entropy_mask, colors=color_contour_tissue, **contour_kwargs)
+    axs[0].contour(qc_mask, colors=color_contour_qc, **contour_kwargs)
+    axs[1].contour(entropy_mask, colors=color_contour_tissue, **contour_kwargs)
+    axs[2].contour(qc_mask, colors=color_contour_qc, **contour_kwargs)
     
     for pax in axs:
         pax.tick_params(direction="in")
@@ -321,9 +268,10 @@ def set_matplotlib_font():
 set_matplotlib_font()
 process_file(r"X:\cycif-production\149-Orion-Awad_Batch2\LSP16096new_P54_A31_C100_HMS_Orion7@20230406_173306_581461.ome.tiff", out_dir=r'X:\cycif-production\149-Orion-Awad_Batch2\qc', plot=True)
 
-
-
-
+# curr = pathlib.Path(r'X:\cycif-production\149-Orion-Awad_Batch2')
+# ometiffs = sorted(curr.glob('*.ome.tiff'))
+# for p in ometiffs:
+#     process_file(p, out_dir=r'X:\cycif-production\149-Orion-Awad_Batch2\qc', plot=True)
 
 
 # ---------------------------------------------------------------------------- #
@@ -337,8 +285,8 @@ def plot_tissue_quality_basic(
     qc_mask,
     thumbnail_extent_factor=1
 ):
-    import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
     fig, axs = plt.subplots(1, 4, sharex=True, sharey=True)
     imshow_kwargs = dict(
         X=thumbnail.astype(float)+1,
