@@ -39,7 +39,7 @@ class TestMetadata(reg.Metadata):
             :m_shape[0]:step_shape[0], :m_shape[1]:step_shape[1]
         ].reshape(2, -1).T
 
-        self._positions = self._slice_positions.copy()
+        self._positions = self._slice_positions.astype(float)
 
         if self.series is not None:
             self._slice_positions = self._slice_positions[self.series]
@@ -135,7 +135,7 @@ def align_cycles(reader1, reader2, scale=0.05):
         print(f'\r    estimated cycle rotation = {angle:.2f} degrees')
         img2 = skimage.transform.rotate(img2, angle, resize=False, center=(0, 0))
     shifts = thumbnail.calculate_image_offset(img1, img2, int(1 / scale))
-    print(f'\r    estimated shift {shifts}')
+    print(f'\r    estimated shift {shifts / scale}')
     tform_steps = [
         ('translation', -reader2.metadata.origin[::-1]),
         ('scale', scale),
@@ -164,15 +164,18 @@ img = skimage.data.astronaut()[..., 1]
 c1r = TestReader(img=img, tile_size=TILE_SIZE)
 
 affine = skimage.transform.AffineTransform
-tform = affine(translation=(50, 100), rotation=np.deg2rad(15))
+tform = affine(
+    translation=200*(np.random.random(2)-.5),
+    rotation=np.deg2rad(10*np.random.random(1)[0])
+)
 
 # apply known transform to image 
 img2 = skimage.transform.warp(img, tform.inverse)
 c2r = TestReader(img=img2, tile_size=TILE_SIZE)
 
 # set random stage origin
-c1r.metadata._positions += np.random.randint(-1000, 1000, 2)
-c2r.metadata._positions += np.random.randint(-1000, 1000, 2)
+c1r.metadata._positions += 2000*(np.random.random(2)-.5)
+c2r.metadata._positions += 2000*(np.random.random(2)-.5)
 
 c1r.thumbnail = thumbnail.make_thumbnail(c1r, scale=.5)
 c2r.thumbnail = thumbnail.make_thumbnail(c2r, scale=.5)
@@ -208,12 +211,6 @@ v.add_image(
 
 v.add_points(
     np.fliplr(cycle_tform(np.fliplr(c2r.metadata.positions)))
-)
-
-v.add_image(
-    thumbnail.make_thumbnail(c2rr, scale=1),
-    translate=c2rr.metadata.origin,
-    colormap='plasma'
 )
 
 for idx, pos in enumerate(c2rr.metadata.positions):
