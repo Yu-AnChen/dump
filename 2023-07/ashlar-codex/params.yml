@@ -1,0 +1,16 @@
+# for MCMICRO run
+workflow:
+  start-at: illumination
+  stop-at: quantification
+  segmentation-channel: 1
+  multi-formats: .ome
+
+options:
+  unmicst: --tool unmicst-duo --scalingFactor 0.58
+  s3seg: --maxima-footprint-size 11 --maxima-h 0.008 --gaussian-sigma 0 --area-max 50000 --expand-size 5 --pixelSize 0.377 --mean-intensity-min 80
+
+modules:
+  watershed:
+    name: s3seg
+    container: labsyspharm/s3segmenter
+    version: 1.5.4-large
