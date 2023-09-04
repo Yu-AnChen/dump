@@ -111,5 +111,31 @@ def test(b, block_info=None):
 mask.map_blocks(test, dtype=int).compute()
 
 # ---------------------------------------------------------------------------- #
+#                      joblib for process parallelization                      #
+# ---------------------------------------------------------------------------- #
+rechunked = mask.rechunk(2048)
+rr, cc = np.indices(rechunked.numblocks)
+rsize, csize = rechunked.chunksize
+
+es = 48
+rs = np.clip(rr * rsize - es, 0, mask.shape[0])
+re = np.clip((rr+1) * rsize + es, 0, mask.shape[0])
+cs = np.clip(cc * csize - es, 0, None)
+ce = np.clip((cc+1) * csize + es, None, mask.shape[1])
+
+import joblib
+
+def wrap(rrs, rre, ccs, cce):
+    mm = reader.pyramid[0][0][rrs:rre, ccs:cce]
+    result = skimage.measure.regionprops_table(mm.compute(), properties=_all_mask_props)
+    result['offset_row'] = np.ones(len(result['label']), dtype=int) * rrs
+    result['offset_col'] = np.ones(len(result['label']), dtype=int) * ccs
+    return result
+_ = joblib.Parallel(verbose=1, backend='loky', n_jobs=12, return_as='list')(
+    joblib.delayed(wrap)(rrs, rre, ccs, cce)
+    for rrs, rre, ccs, cce in zip(*np.array([rs, re, cs, ce]).reshape(4, -1))
+)
+
+# ---------------------------------------------------------------------------- #
 #                         Next is to monitor RAM usage                         #
 # ---------------------------------------------------------------------------- #
