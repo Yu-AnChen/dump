@@ -6,7 +6,6 @@ import numpy as np
 
 import palom
 
-
 # ---------------------------------------------------------------------------- #
 #                          matplotlib helper functions                         #
 # ---------------------------------------------------------------------------- #
@@ -31,8 +30,12 @@ def save_all_figs(dpi=300, format='pdf', out_dir=None):
 # ---------------------------------------------------------------------------- #
 #                                  main script                                 #
 # ---------------------------------------------------------------------------- #
-files = ['file1', 'file2', 'file3']
-output_path = pathlib.Path('/path/to/output.ome.tif')
+files = [
+    'small-ome-tiff/S3_T1-4_I0.ome.tif',
+    'small-ome-tiff/S3_T5-8_I0.ome.tif',
+    'small-ome-tiff/S3_T9-12_I0.ome.tif'
+]
+output_path = pathlib.Path('small-ome-tiff/registered.ome.tif')
 
 out_dir = output_path.parent
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -40,8 +43,13 @@ out_dir.mkdir(parents=True, exist_ok=True)
 readers = [palom.reader.OmePyramidReader(f) for f in files]
 ref_reader = readers[0]
 
-THUMBNAIL_LEVEL = ref_reader.get_thumbnail_level_of_size(2000)
-CHANNEL = 0
+# workaround for file-is-closed issue
+for reader in readers:
+    _ = reader.pyramid[0].blocks.ravel()[0].persist()
+
+
+THUMBNAIL_LEVEL = ref_reader.get_thumbnail_level_of_size(500)
+CHANNEL = 2
 
 aligners = []
 for reader in readers[1:]:
@@ -59,7 +67,7 @@ for reader in readers[1:]:
 
 N_KEYPOINTS = 5_000
 
-mosaics = []
+mosaics = [ref_reader.pyramid[0]]
 for aligner, reader in zip(aligners, readers[1:]):
     p1 = ref_reader.path
     p2 = reader.path
@@ -86,7 +94,7 @@ for aligner, reader in zip(aligners, readers[1:]):
     mosaics.append(mosaic)
 
 palom.pyramid.write_pyramid(
-    mosaics=[mosaic],
+    mosaics=mosaics,
     output_path=output_path,
     pixel_size=ref_reader.pixel_size,
     compression='zlib',
