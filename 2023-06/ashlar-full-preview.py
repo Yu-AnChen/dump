@@ -1,8 +1,8 @@
-import zarr
-import numpy as np
 import joblib
-from ashlar import reg
+import numpy as np
 import tqdm
+import zarr
+from ashlar import reg
 
 
 def _paste(target, img, pos):
@@ -12,7 +12,7 @@ def _paste(target, img, pos):
 
 
 def _pyramid_shapes(img_path):
-    metadata = reg.BioformatsMetadata(img_path)
+    metadata = reg.BioformatsMetadata(str(img_path))
     base_shape = np.ceil(
         metadata.positions.max(axis=0) - metadata.origin + metadata.size
     ).astype(int)
@@ -27,10 +27,14 @@ def make_reader_pyramid(img_path, parallelize):
     assert parallelize in ['channel', 'tile']
     shapes = _pyramid_shapes(img_path)
 
-    metadata = reg.BioformatsMetadata(img_path)
+    metadata = reg.BioformatsMetadata(str(img_path))
     num_channels = metadata.num_channels
 
-    cache_path = r"C:\rcpnl\scans\000-dev\ttt.zarr"
+    cache_dir = pathlib.Path(CACHE_DIR)
+    cache_path = cache_dir / f"{pathlib.Path(img_path).stem}-ashlar-lt.zarr"
+    if cache_path.exists():
+        print(f"{cache_path} already exists.")
+        return None
     root = zarr.open(cache_path, mode='w')
 
     root.create_groups(*range(3))
@@ -54,8 +58,11 @@ def make_reader_pyramid(img_path, parallelize):
     return root
 
 
+# ---------------------------------------------------------------------------- #
+#                 Parallel channel mosaic assembly and writing                 #
+# ---------------------------------------------------------------------------- #
 def paste_tile(img_path, channel, zgroup, verbose=False):
-    reader = reg.BioformatsReader(img_path)
+    reader = reg.BioformatsReader(str(img_path))
     positions = reader.metadata.positions
     positions -= reader.metadata.origin
     positions = np.ceil(positions).astype(int)
@@ -73,13 +80,16 @@ def paste_tile(img_path, channel, zgroup, verbose=False):
             )
 
 
+# ---------------------------------------------------------------------------- #
+#                           Parallelize tile reading                           #
+# ---------------------------------------------------------------------------- #
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def paste_tile_parallel(img_path, channel, zgroup):
-    reader = ThreadSafeBioformatsReader(img_path)
+    reader = ThreadSafeBioformatsReader(str(img_path))
     positions = reader.metadata.positions
     positions -= reader.metadata.origin
     positions = np.ceil(positions).astype(int)
@@ -118,9 +128,12 @@ class ThreadSafeBioformatsReader(reg.BioformatsReader):
             return super().read(*args, **kwargs)
 
 
-import platform
+# ---------------------------------------------------------------------------- #
+#                       Helper to handle Windows shortcut                      #
+# ---------------------------------------------------------------------------- #
 import os
 import pathlib
+import platform
 
 
 # handle processing on window shortcuts 
@@ -141,71 +154,63 @@ def get_path(path):
     return pathlib.Path(path)
 
 
-import time, datetime
-
-# img_path = r"C:\rcpnl\scans\LSP15513@20230610_164824_823377\LSP15513@20230610_164824_823377.rcpnl"
-img_path = r"C:\rcpnl\YX_GBM-PDX\LSP17019@20230531_225954_474845\LSP17019@20230531_225954_474845.rcpnl"
-start_time = time.perf_counter()
-
-zzz = make_reader_pyramid(img_path, 'channel')
-
-end_time = time.perf_counter()
-
-print()
-print('elapsed', datetime.timedelta(seconds=int(end_time)-int(start_time)))
-print()
-
-
-
-import dask.array as da
-import napari
-pyramid = [
-    da.array([da.from_zarr(aa) for aa in group.values()])
-    for _, group in zzz.groups()
-]
-pyramid[1] = pyramid[1].persist()
-pyramid[2] = pyramid[2].persist()
-
-v = napari.Viewer()
-v.add_image(pyramid, channel_axis=0, contrast_limits=(0, 65535))
-
-
-
-
-
-
-# could use watchdog to monitor directory file changes
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------- #
-#                                   version 1                                  #
+#                         Process folder with shortcuts                        #
 # ---------------------------------------------------------------------------- #
+import datetime
+import time
+import warnings
 
-c1r = reg.BioformatsReader(r"C:\rcpnl\scans\LSP12317@20230601_202742_555378\LSP12317@20230601_202742_555378.rcpnl")
+TARGET_DIR = r'D:\20230915-ashlar-lt-preview'
+CACHE_DIR = r'D:\000-ASHLAR-LT'
 
-zzz = make_reader_pyramid(c1r)
 
-import dask.array as da
-import napari
-pyramid = [
-    da.array([da.from_zarr(aa) for aa in group.values()])
-    for _, group in zzz.groups()
-]
-pyramid[1] = pyramid[1].persist()
-pyramid[2] = pyramid[2].persist()
+def _process_path(filepath):
+    filepath = get_path(filepath)
+    rcpnl, rcjob = None, None
+    if not filepath.exists(): return
+    if filepath.is_dir():
+        rcpnl = next(filepath.glob('*.rcpnl'), None)
+        rcjob = next(filepath.glob('*.rcjob'), None)
+    if filepath.suffix == '.rcpnl':
+        rcpnl = filepath
+    return rcpnl, rcjob
 
-v = napari.Viewer()
-v.add_image(pyramid, channel_axis=0, contrast_limits=(0, 65535))
+
+def _to_log(log_path, img_path, img_shape, time_diff):
+    pathlib.Path(log_path).parent.mkdir(exist_ok=True, parents=True)
+    with open(log_path, 'a') as log_file:
+        log_file.write(
+            f"{datetime.timedelta(seconds=time_diff)} | {img_path.name} | {img_shape} \n"
+        )
+
+
+def process_dir(target_dir):
+    cache_dir = pathlib.Path(CACHE_DIR)
+    cache_dir.mkdir(exist_ok=True, parents=True)
+    target_dir = pathlib.Path(target_dir)
+    slides = []
+    for filepath in target_dir.iterdir():
+        slides.append(_process_path(filepath))
+    slides = filter(lambda x: x[0], slides)
+
+    for rcpnl, rcjob in slides:
+        img_path = rcpnl
+        print('Processing', rcpnl)
+        start_time = time.perf_counter()
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                action='ignore',
+                category=reg.DataWarning,
+            )
+            store = make_reader_pyramid(str(img_path), 'channel')
+        if store is None:
+            continue
+        end_time = time.perf_counter()
+        img_shape = (len(store[0]), *store['/0/0'].shape)
+        time_diff = int(end_time - start_time)
+        _to_log(cache_dir / '000-process.log', rcpnl, img_shape, time_diff)
+
+        print()
+        print('elapsed', datetime.timedelta(seconds=time_diff))
+
