@@ -30,7 +30,7 @@ def make_reader_pyramid(img_path, parallelize):
     metadata = reg.BioformatsMetadata(str(img_path))
     num_channels = metadata.num_channels
 
-    cache_dir = pathlib.Path(CACHE_DIR)
+    cache_dir = get_path(CACHE_DIR)
     cache_path = cache_dir / f"{pathlib.Path(img_path).stem}-ashlar-lt.zarr"
     if cache_path.exists():
         print(f"{cache_path} already exists.")
@@ -161,8 +161,8 @@ import datetime
 import time
 import warnings
 
-TARGET_DIR = r'D:\20230915-ashlar-lt-preview'
-CACHE_DIR = r'D:\000-ASHLAR-LT'
+TARGET_DIR = r"C:\Users\rarecyte\Desktop\INPUT-ashlar-lt"
+CACHE_DIR = r"C:\Users\rarecyte\Desktop\OUTPUT-ashlar-lt.lnk"
 
 
 def _process_path(filepath):
@@ -186,7 +186,7 @@ def _to_log(log_path, img_path, img_shape, time_diff):
 
 
 def process_dir(target_dir):
-    cache_dir = pathlib.Path(CACHE_DIR)
+    cache_dir = get_path(CACHE_DIR)
     cache_dir.mkdir(exist_ok=True, parents=True)
     target_dir = pathlib.Path(target_dir)
     slides = []
@@ -214,3 +214,6 @@ def process_dir(target_dir):
         print()
         print('elapsed', datetime.timedelta(seconds=time_diff))
 
+
+if __name__ == '__main__':
+    process_dir(TARGET_DIR)
