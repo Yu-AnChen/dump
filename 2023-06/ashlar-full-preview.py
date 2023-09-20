@@ -38,6 +38,10 @@ def _paste(target, img, pos):
 @ignore_warnings_stage_position_unit
 def _pyramid_shapes(img_path):
     metadata = reg.BioformatsMetadata(str(img_path))
+    _p = metadata.positions
+    metadata._positions, _ = snap_positions_to_grid(
+        _p - metadata.origin, metadata.size
+    )
     base_shape = np.ceil(
         metadata.positions.max(axis=0) - metadata.origin + metadata.size
     ).astype(int)
@@ -198,8 +202,9 @@ def add_channel_metadata(
 
 
 @ignore_warnings_stage_position_unit
-def make_reader_pyramid(img_path, parallelize):
+def make_reader_pyramid(img_path, parallelize, overlap_mode='trim'):
     assert parallelize in ['channel', 'tile']
+    assert overlap_mode in ['trim', 'tile']
     shapes = _pyramid_shapes(img_path)
 
     metadata = reg.BioformatsMetadata(str(img_path))
@@ -213,6 +218,11 @@ def make_reader_pyramid(img_path, parallelize):
         print(f"{cache_path} already exists.")
         return None
 
+    _, grid_tile_shape = snap_positions_to_grid(
+        metadata.positions - metadata.origin, tile_shape, overlap_mode
+    )
+    if overlap_mode == 'trim':
+        tile_shape = grid_tile_shape
     root = _make_ngff(
         cache_path,
         (num_channels, *shapes[0]),
@@ -240,6 +250,11 @@ def make_reader_pyramid(img_path, parallelize):
 @ignore_warnings_stage_position_unit
 def paste_tile(img_path, channel, zgroup, verbose=False):
     reader = reg.BioformatsReader(str(img_path))
+    
+    _p = reader.metadata.positions
+    reader.metadata._positions, (tile_height, tile_width) = snap_positions_to_grid(
+        _p - reader.metadata.origin, reader.metadata.size
+    )
     positions = reader.metadata.positions
     positions -= reader.metadata.origin
     positions = np.floor(positions).astype(int)
@@ -248,7 +263,7 @@ def paste_tile(img_path, channel, zgroup, verbose=False):
     if verbose:
         enum = enumerate(tqdm.tqdm(positions))
     for idx, pp in enum:
-        img = reader.read(idx, channel)
+        img = reader.read(idx, channel)[:tile_height, :tile_width]
         for i, (_, aa) in enumerate(zgroup.arrays()):
             rs, cs = np.floor(pp / 8**i).astype(int)
             _img = img[::8**i, ::8**i]
@@ -267,12 +282,18 @@ from typing import Callable
 @ignore_warnings_stage_position_unit
 def paste_tile_parallel(img_path, channel, zgroup):
     reader = ThreadSafeBioformatsReader(str(img_path))
+
+    _p = reader.metadata.positions
+    reader.metadata._positions, (tile_height, tile_width) = snap_positions_to_grid(
+        _p - reader.metadata.origin, reader.metadata.size
+    )
+
     positions = reader.metadata.positions
     positions -= reader.metadata.origin
     positions = np.floor(positions).astype(int)
     
     def _paste_tile(tile, pos):
-        img = reader.read(tile, channel)
+        img = reader.read(tile, channel)[:tile_height, :tile_width]
         for i, (_, aa) in enumerate(zgroup.arrays()):
             _paste(
                 aa[channel],
@@ -339,8 +360,8 @@ import time
 import warnings
 
 
-TARGET_DIR = r"/Users/yuanchen/Dropbox (HMS)/ashlar-dev-data/ashlar-rotation-data/2"
-CACHE_DIR = r"/Users/yuanchen/projects/napari-wsi-reader/src/.dev"
+TARGET_DIR = r"C:\Users\rarecyte\Desktop\INPUT-ashlar-lt"
+CACHE_DIR = r"C:\Users\rarecyte\Desktop\OUTPUT-ashlar-lt.lnk"
 
 
 def _process_path(filepath):
@@ -400,6 +421,20 @@ def process_dir(target_dir):
 
         print('elapsed', datetime.timedelta(seconds=time_diff))
         print()
+
+
+def snap_positions_to_grid(positions, tile_shape, mode='trim'):
+    assert mode in ['tile', 'trim']
+    rp, cp = positions.T
+    # assume overlaps must < 50 % of tile shape
+    # tile positions must form a dense grid
+    rstep = rp[rp > 0.5 * tile_shape[0]].min()
+    cstep = cp[cp > 0.5 * tile_shape[1]].min()
+    if mode == 'trim':
+        tile_shape = np.round([rstep, cstep]).astype(int)
+    grid_positions = np.round(positions / [rstep, cstep]).astype(int) * np.array(tile_shape)
+    return grid_positions, tile_shape
+
 
 
 if __name__ == '__main__':
