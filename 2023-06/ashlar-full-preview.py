@@ -62,17 +62,17 @@ def _make_ngff(path, shape, tile_shape=None, dtype='uint16', pixel_size=1):
     root = zarr.group(store=store, overwrite=True)
     # Total 3 levels, 8x downsizing each level
     n_levels = 3
+    downscale_factor = 8
     scaler = ome_zarr.scale.Scaler(
-        downscale=8,
+        downscale=downscale_factor,
         max_layer=n_levels-1,
         method='nearest',
         copy_metadata=False,
         in_place=False,
         labeled=False,
     )
-    # Is this a point of optimization?
-    # FIXME add 1 px to highest level pyramid
-    data = da.zeros([shape[0], shape[1]+8**2, shape[2]+8**2], dtype=dtype)
+
+    data = da.zeros(shape, dtype=dtype)
 
     if tile_shape is None: tile_shape = (1024, 1024)
     chunks = [
@@ -89,6 +89,15 @@ def _make_ngff(path, shape, tile_shape=None, dtype='uint16', pixel_size=1):
         storage_options=[dict(chunks=cc) for cc in chunks],
         compute=False
     )
+    # default ngff downscaled levels use trim instead of pad and therefore are
+    # missing 1 pixel; resize to padded shapes here 
+    shapes = [
+        (shape[0], *np.ceil(np.array(shape)[1:] / downscale_factor**i).astype(int))
+        for i in range(n_levels)
+    ]
+    for (_, aa), ss in zip(root.arrays(), shapes):
+        aa.resize(ss)
+
     root.attrs['multiscales'] = _update_pixel_size(
         root.attrs['multiscales'], pixel_size
     )
@@ -118,8 +127,6 @@ def _update_pixel_size(multiscale_metadata, pixel_size, downscale_factor=8):
         **{'axes': axes, 'datasets': datasets}
     }
     return [updated]
-
-    ...
 
 
 def _rcjob_channel_names(rcjob_path):
@@ -237,7 +244,7 @@ def make_reader_pyramid(img_path, parallelize, overlap_mode='trim'):
     
     if parallelize == 'channel':
         n_jobs = min(num_channels, joblib.cpu_count())
-        _ = joblib.Parallel(n_jobs=4, verbose=0)(
+        _ = joblib.Parallel(n_jobs=n_jobs, verbose=0)(
             joblib.delayed(paste_tile)(img_path, channel, root, verbose)
             for channel, verbose in zip(range(num_channels), [True]+(num_channels-1)*[False]) 
         )
@@ -430,8 +437,10 @@ def snap_positions_to_grid(positions, tile_shape, mode='trim'):
     # tile positions must form a dense grid
     rstep = rp[rp > 0.5 * tile_shape[0]].min()
     cstep = cp[cp > 0.5 * tile_shape[1]].min()
+    
     if mode == 'trim':
-        tile_shape = np.round([rstep, cstep]).astype(int)
+        # use tiff compatible tile size
+        tile_shape = np.round(np.divide([rstep, cstep], 16)).astype(int) * 16
     grid_positions = np.round(positions / [rstep, cstep]).astype(int) * np.array(tile_shape)
     return grid_positions, tile_shape
 
