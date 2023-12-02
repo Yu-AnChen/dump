@@ -1,87 +1,86 @@
-import palom
-import numpy as np
-import napari
-import ome_types
+import copy
+import pathlib
 import re
+import warnings
+
+import matplotlib.pyplot as plt
+import napari
+import numpy as np
+import ome_types
+import palom
+import skimage.exposure
 import skimage.transform
-import itertools
-
-
-# ---------------------------------------------------------------------------- #
-#                  Coarse to fine approach gives better result                 #
-# ---------------------------------------------------------------------------- #
-def crop_around_center(aligner, center_yx, center_in="moving", crop_size=1000):
-    assert len(center_yx) == 2
-    y, x = center_yx
-    assert center_in in ["ref", "moving"]
-    tform = aligner.tform
-    if center_in == "ref":
-        tform = aligner.tform.inverse
-    half = int(crop_size / 2)
-
-    o_vertices = list(itertools.product([x - half, x + half], [y - half, y + half]))
-    t_vertices = tform(o_vertices)
-
-    o_cs, o_rs = np.floor(o_vertices).min(axis=0).astype(int)
-    o_ce, o_re = np.ceil(o_vertices).max(axis=0).astype(int)
-    t_cs, t_rs = np.floor(t_vertices).min(axis=0).astype(int)
-    t_ce, t_re = np.ceil(t_vertices).max(axis=0).astype(int)
-
-    if center_in == "moving":
-        o_img = aligner.moving_img
-        t_img = aligner.ref_img
-    else:
-        o_img = aligner.ref_img
-        t_img = aligner.moving_img
-
-    o_h, o_w = o_img.shape
-    t_h, t_w = t_img.shape
-
-    o_rs, o_re = np.clip([o_rs, o_re], 0, o_h)
-    o_cs, o_ce = np.clip([o_cs, o_ce], 0, o_w)
-    t_rs, t_re = np.clip([t_rs, t_re], 0, t_h)
-    t_cs, t_ce = np.clip([t_cs, t_ce], 0, t_w)
-
-    o_img = o_img[o_rs:o_re, o_cs:o_ce]
-    t_img = t_img[t_rs:t_re, t_cs:t_ce]
-
-    if center_in == "moving":
-        return t_img, o_img, (t_rs, t_cs), (o_rs, o_cs)
-    else:
-        return o_img, t_img, (o_rs, o_cs), (t_rs, t_cs)
+import tqdm
 
 
 def align_around_center(
-    aligner, center_yx, center_in="moving", crop_size=1000, downscale_factor=4
+    aligner,
+    center_yx,
+    center_in="moving",
+    crop_size=2000,
+    downscale_factor=5,
+    valid_cutoff=0.1,
+    max_crop_size=10_000,
 ):
-    ref, moving, ref_ori, moving_ori = crop_around_center(
-        aligner, center_yx, center_in=center_in, crop_size=crop_size
-    )
-    if (0 in ref.shape) or (0 in moving.shape):
+    assert valid_cutoff > 0
+    crop_size = int(crop_size)
+    downscale_factor = int(downscale_factor)
+    _center_yx = center_yx
+
+    if crop_size > max_crop_size:
         return aligner.affine_matrix
+
+    if center_in == "moving":
+        center_yx = aligner.tform([center_yx[::-1]])[0][::-1]
+
+    row_s, col_s = np.clip(
+        np.floor(np.subtract(center_yx, crop_size / 2)).astype(int), 0, None
+    )
+    img1 = aligner.ref_img[row_s : row_s + crop_size, col_s : col_s + crop_size]
+    img2 = palom.block_affine.block_affine(
+        (row_s, col_s),
+        block_shape=(crop_size, crop_size),
+        src_img=aligner.moving_img,
+        transformation=aligner.tform,
+    )
+    if 0 in [*img1.shape, *img2.shape]:
+        return align_around_center(
+            aligner,
+            center_yx=_center_yx,
+            center_in=center_in,
+            crop_size=2 * crop_size,
+            downscale_factor=2 * downscale_factor,
+        )
+    simg1 = palom.img_util.cv2_downscale_local_mean(img1, downscale_factor)
+    simg2 = palom.img_util.cv2_downscale_local_mean(img2, downscale_factor)
     refined_mx = palom.register.feature_based_registration(
-        palom.img_util.cv2_downscale_local_mean(ref, downscale_factor),
-        palom.img_util.cv2_downscale_local_mean(moving, downscale_factor),
+        simg1,
+        simg2,
         plot_match_result=True,
-        n_keypoints=10_000,
+        n_keypoints=20_000,
         plot_individual_result=False,
     )
+    plt.gca().set_title(
+        f"Center ({center_in}): ({_center_yx[0]:.2f}, {_center_yx[1]:.2f})"
+    )
+    if np.linalg.norm(np.diag(refined_mx) - 1) > valid_cutoff:
+        return align_around_center(
+            aligner,
+            center_yx=_center_yx,
+            center_in=center_in,
+            crop_size=2 * crop_size,
+            downscale_factor=2 * downscale_factor,
+        )
     refined_mx = np.vstack([refined_mx, [0, 0, 1]])
     Affine = skimage.transform.AffineTransform
-    # affine_matrix = (
-    #     np.linalg.inv(Affine(translation=-1 * np.array(ref_ori)[::-1]).params)
-    #     @ np.linalg.inv(Affine(scale=1 / downscale_factor).params)
-    #     @ refined_mx
-    #     @ Affine(scale=1 / downscale_factor).params
-    #     @ Affine(translation=-1 * np.array(moving_ori)[::-1]).params
-    # )
     affine_matrix = (
         Affine()
-        + Affine(translation=-1 * np.array(moving_ori)[::-1])
+        + Affine(matrix=aligner.affine_matrix)
+        + Affine(translation=-1 * np.array([col_s, row_s]))
         + Affine(scale=1 / downscale_factor)
         + Affine(matrix=refined_mx)
         + Affine(scale=1 / downscale_factor).inverse
-        + Affine(translation=-1 * np.array(ref_ori)[::-1]).inverse
+        + Affine(translation=-1 * np.array([col_s, row_s])).inverse
     ).params
     return affine_matrix
 
@@ -89,11 +88,14 @@ def align_around_center(
 def view_coarse_align(reader1, reader2, affine_mx):
     v = napari.Viewer()
     kwargs = dict(visible=False, contrast_limits=(0, 50000), blending="additive")
-    v.add_image([p[0] for p in reader1.pyramid], colormap="bop blue", **kwargs)
+    v.add_image(
+        [p[0] for p in reader1.pyramid], colormap="bop blue", name="cycif", **kwargs
+    )
     v.add_image(
         [p[0] for p in reader2.pyramid],
         colormap="bop orange",
         affine=palom.img_util.to_napari_affine(affine_mx),
+        name="geomx",
         **kwargs,
     )
     return v
@@ -103,140 +105,332 @@ def parse_roi_points(all_points):
     return np.array(re.findall(r"-?\d+\.?\d+", all_points), dtype=float).reshape(-1, 2)
 
 
-cycif_path = r"V:\hits\lsp\collaborations\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\STIC_Batch2_2023\LSP15331\registration\LSP15331.ome.tif"
-r1 = palom.reader.OmePyramidReader(cycif_path)
-
-geomx_path = r"X:\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\p110_e4_OvarianSTIC_GeoMx\GeoMx_OME_tiff\LSP15332_Scan1.ome.tiff"
-r2 = palom.reader.OmePyramidReader(geomx_path)
-
-c21l = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
-c21l.coarse_register_affine(n_keypoints=10000)
-
-
-ome = ome_types.from_tiff(geomx_path)
-shapes = [rr.union[1] for rr in ome.rois]
-polygons = filter(lambda x: isinstance(x, ome_types.model.polygon.Polygon), shapes)
-polygons = [np.fliplr(parse_roi_points(pp.points)) for pp in polygons]
-polygon_centers = [0.5 * (pp.min(axis=0) + pp.max(axis=0)) for pp in polygons]
-
-v = view_coarse_align(r1, r2, c21l.affine_matrix)
-v.add_shapes(
-    polygons,
-    shape_type="polygon",
-    affine=palom.img_util.to_napari_affine(c21l.affine_matrix),
-    face_color="#ffffff00",
-    edge_color="salmon",
-    edge_width=20,
-)
-
-polygon_affine_mxs = []
-for pp, cc in zip(polygons, polygon_centers):
-    mx = align_around_center(c21l, cc, crop_size=2000, downscale_factor=4)
-    polygon_affine_mxs.append(mx)
-
-t_polygons = []
-for pp, mm in zip(polygons, polygon_affine_mxs):
-    tform = skimage.transform.AffineTransform(matrix=mm)
-    t_polygons.append(np.fliplr(tform(np.fliplr(pp))))
-
-v.add_shapes(
-    t_polygons,
-    shape_type="polygon",
-    face_color="#ffffff00",
-    edge_color="lightgreen",
-    edge_width=20,
-)
-
-
-# ---------------------------------------------------------------------------- #
-#                    Use single affine from wsi to map ROIs                    #
-# ---------------------------------------------------------------------------- #
-def view_coarse_align(reader1, reader2, affine_mx):
-    v = napari.Viewer()
-    kwargs = dict(visible=False, contrast_limits=(0, 50000), blending="additive")
-    v.add_image([p[0] for p in reader1.pyramid], colormap="bop blue", **kwargs)
-    v.add_image(
-        [p[0] for p in reader2.pyramid],
-        colormap="bop orange",
-        affine=palom.img_util.to_napari_affine(affine_mx),
-        **kwargs,
+def roi_center_yx(roi: ome_types.model.ROI):
+    shapes = roi.union
+    model = ome_types.model
+    geometries = (
+        model.Point,
+        model.Polygon,
+        model.Polyline,
+        model.Rectangle,
+        model.Ellipse,
+        model.Line,
     )
-    return v
+    # Prioritize geometries
+    is_geometry = [True if isinstance(ss, geometries) else False for ss in shapes]
+    index = 0
+    if True in is_geometry:
+        index = is_geometry.index(True)
+
+    shape = shapes[index]
+    if hasattr(shape, "y") & hasattr(shape, "x"):
+        h, w = 0, 0
+        if hasattr(shape, "height"):
+            h = shape.height
+        if hasattr(shape, "width"):
+            w = shape.width
+        yx = shape.y + 0.5 * h, shape.x + 0.5 * w
+    elif isinstance(shape, model.Line):
+        yx = np.mean([(shape.y1, shape.y2), (shape.x1, shape.x2)], axis=0)
+    else:
+        points = np.fliplr(parse_roi_points(shape.points))
+        yx = 0.5 * (points.min(axis=0) + points.max(axis=0))
+    if shape.transform is not None:
+        tt = shape.transform
+        mx = [[tt.a00, tt.a01, tt.a02], [tt.a10, tt.a11, tt.a12], [0, 0, 1]]
+        tform = skimage.transform.AffineTransform(matrix=mx)
+        yx = np.fliplr(tform(np.fliplr([yx])))
+    return np.array(yx)
 
 
-def parse_roi_points(all_points):
-    return np.array(re.findall(r"-?\d+\.?\d+", all_points), dtype=float).reshape(-1, 2)
+def to_napari_shape(roi):
+    # FIXME need to add transformation
+    # FIXME support other types of ROI
+    assert isinstance(roi, (ome_types.model.Polygon, ome_types.model.Ellipse))
+    if isinstance(roi, ome_types.model.Polygon):
+        return np.fliplr(parse_roi_points(roi.points)), "polygon"
+    if isinstance(roi, ome_types.model.Ellipse):
+        p1 = roi.y - roi.radius_y, roi.x - roi.radius_x
+        p2 = roi.y - roi.radius_y, roi.x + roi.radius_x
+        p3 = roi.y + roi.radius_y, roi.x + roi.radius_x
+        p4 = roi.y + roi.radius_y, roi.x - roi.radius_x
+        return [p1, p2, p3, p4], "ellipse"
 
 
-cycif_path = r"V:\hits\lsp\collaborations\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\STIC_Batch2_2023\LSP15331\registration\LSP15331.ome.tif"
-r1 = palom.reader.OmePyramidReader(cycif_path)
+def make_roi_ome_xml(ref_ome, affine_mxs, geometry_only=False):
+    assert isinstance(affine_mxs, (list, tuple))
+    assert len(affine_mxs) == len(ref_ome.rois)
 
-geomx_path = r"X:\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\p110_e4_OvarianSTIC_GeoMx\GeoMx_OME_tiff\LSP15332_Scan1.ome.tiff"
-r2 = palom.reader.OmePyramidReader(geomx_path)
+    out_ome = ome_types.OME()
 
-c21l = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
-c21l.coarse_register_affine(n_keypoints=10000)
+    out_ome.creator = "yu-anchen"
+    out_ome.rois = copy.deepcopy(ref_ome.rois)
+    out_ome.structured_annotations = copy.deepcopy(ref_ome.structured_annotations)
+
+    ome_tforms = [
+        ome_types.model.AffineTransform(
+            **dict(zip(["a00", "a01", "a02", "a10", "a11", "a12"], mx.flatten()[:6]))
+        )
+        for mx in affine_mxs
+    ]
+
+    for roi, ot in zip(out_ome.rois, ome_tforms):
+        for ss in roi.union:
+            ss.transform = ot
+
+    if not geometry_only:
+        return out_ome
+
+    texts = [
+        " | ".join(list(filter(lambda x: x, [ss.text for ss in roi.union])))
+        for roi in out_ome.rois
+    ]
+    geometries = (
+        ome_types.model.Point,
+        ome_types.model.Polygon,
+        ome_types.model.Polyline,
+        ome_types.model.Rectangle,
+        ome_types.model.Ellipse,
+        ome_types.model.Line,
+    )
+    for roi, text in zip(out_ome.rois, texts):
+        if roi.name is not None:
+            roi.name = f"{roi.name} || {text}"
+        else:
+            roi.name = text
+        for ss in roi.union:
+            ss.text = text
+        roi.union = list(filter(lambda x: isinstance(x, geometries), roi.union))
+    return out_ome
 
 
-ome = ome_types.from_tiff(geomx_path)
-shapes = [rr.union[1] for rr in ome.rois]
-polygons = filter(lambda x: isinstance(x, ome_types.model.polygon.Polygon), shapes)
-polygons = [np.fliplr(parse_roi_points(pp.points)) for pp in polygons]
+def save_all_figs(dpi=300, format="pdf", out_dir=None, prefix=None):
+    figs = [plt.figure(i) for i in plt.get_fignums()]
+    if prefix is not None:
+        for f in figs:
+            if f._suptitle:
+                f.suptitle(f"{prefix} {f._suptitle.get_text()}")
+            else:
+                f.suptitle(prefix)
+    names = [f._suptitle.get_text() if f._suptitle else "" for f in figs]
+    out_dir = pathlib.Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    for f, n, nm in zip(figs, plt.get_fignums(), names):
+        f.savefig(out_dir / f"{n}-{nm}.{format}", dpi=dpi, bbox_inches="tight")
+        plt.close(f)
 
 
-v = view_coarse_align(r1, r2, c21l.affine_matrix)
-v.add_shapes(
-    polygons,
-    shape_type="polygon",
-    affine=palom.img_util.to_napari_affine(c21l.affine_matrix),
-    face_color="#ffffff00",
-    edge_color="salmon",
-    edge_width=20,
-)
-
-tform = skimage.transform.AffineTransform(matrix=c21l.affine_matrix)
-v.add_shapes([np.fliplr(tform(np.fliplr(pp))) for pp in polygons], shape_type="polygon")
-# The result isn't satisfying, it will require manual adjustment afterward
-
-# ---------------------------------------------------------------------------- #
-#        Tested multi-object aligner, didn't seem to improve the result        #
-# ---------------------------------------------------------------------------- #
-moa = palom.align_multi_obj.MultiObjAligner(r1, r2)
-moa.segment_objects(plot_segmentation=True, downscale_factor=2)
+def set_subplot_size(w, h, ax=None):
+    """w, h: width, height in inches"""
+    if not ax:
+        ax = plt.gca()
+    l = ax.figure.subplotpars.left  # noqa: E741
+    r = ax.figure.subplotpars.right
+    t = ax.figure.subplotpars.top
+    b = ax.figure.subplotpars.bottom
+    figw = float(w) / (r - l)
+    figh = float(h) / (t - b)
+    ax.figure.set_size_inches(figw, figh)
 
 
-c21l = moa.make_aligner()
-masked_t1 = np.full_like(c21l.ref_thumbnail, moa.fill_value_ref_thumbnail)
-masked_t2 = np.full_like(c21l.moving_thumbnail, moa.fill_value_moving_thumbnail)
+def run_pair(
+    cycif_path: str | pathlib.Path,
+    geomx_path: str | pathlib.Path,
+    out_dir: str | pathlib.Path,
+    geomx_roi_path: str | pathlib.Path = None,
+    crop_size: int = 2000,
+    downscale_factor: int = 5,
+    refine: bool = False,
+    viz_napari: bool = False,
+):
+    from loguru import logger
 
-rs, re, cs, ce = moa.bbox_ref_thumbnail[1]
-rsm, rem, csm, cem = palom.align_multi_obj.transform_bbox(
-    moa.bbox_ref_thumbnail, moa.baseline_coarse_affine_matrix
-)[1]
+    out_dir = pathlib.Path(out_dir)
+    out_dir.mkdir(exist_ok=True, parents=True)
+    (out_dir / "qc").mkdir(exist_ok=True)
 
-masked_t1[rs:re, cs:ce] = c21l.ref_thumbnail[rs:re, cs:ce]
-masked_t2[rsm:rem, csm:cem] = c21l.moving_thumbnail[rsm:rem, csm:cem]
+    (out_dir / "log").mkdir(exist_ok=True)
+    logger.remove()
+    logger.add(out_dir / "log" / f"{pathlib.Path(cycif_path).stem}.log", level="INFO")
 
-c21l.ref_thumbnail = masked_t1
-c21l.moving_thumbnail = masked_t2
-c21l.coarse_register_affine(n_keypoints=10000)
+    r1 = palom.reader.OmePyramidReader(cycif_path)
+    r2 = palom.reader.OmePyramidReader(geomx_path)
 
-_c21l = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
-_c21l.coarse_register_affine(n_keypoints=10000)
+    p1 = r1.path
+    p2 = r2.path
 
-v = napari.Viewer()
-kwargs = dict(visible=False, contrast_limits=(0, 50000), blending="additive")
-v.add_image([p[0] for p in r1.pyramid], colormap="bop blue", **kwargs)
-v.add_image(
-    [p[0] for p in r2.pyramid],
-    colormap="bop orange",
-    affine=palom.img_util.to_napari_affine(c21l.affine_matrix),
-    **kwargs,
-)
+    ome = ome_types.from_tiff(p2, parser="lxml", validate=False)
+    if (ome.rois is None) or (len(ome.rois) == 0):
+        print(
+            f"No ROI detected in {p2}, which is expected to be an OME-TIFF exported"
+            f" from the NanoString software"
+        )
+        if geomx_roi_path is None:
+            print("`geomx_roi_path` is not specified")
+            return
+        ome = ome_types.from_xml(geomx_roi_path, parser="lxml", validate=False)
+        if (ome.rois is None) or (len(ome.rois) == 0):
+            print(f"No ROI detected in {geomx_roi_path}, either")
+            return
 
-v.add_image(
-    [p[0] for p in r2.pyramid],
-    colormap="bop orange",
-    affine=palom.img_util.to_napari_affine(_c21l.affine_matrix),
-    **kwargs,
-)
+    c21l = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
+    c21l.coarse_register_affine(n_keypoints=10000)
+
+    fig, ax = plt.gcf(), plt.gca()
+    fig.suptitle(f"{p2.name} (coarse alignment)", fontsize=8)
+    ax.set_title(f"{p1.name} - {p2.name}", fontsize=6)
+    im_h, im_w = ax.images[0].get_array().shape
+    set_subplot_size(im_w / 288, im_h / 288, ax=ax)
+    ax.set_anchor("N")
+    # use 0.5 inch on the top for figure title
+    fig.subplots_adjust(top=1 - 0.5 / fig.get_size_inches()[1])
+    save_all_figs(out_dir=out_dir / "qc", format="jpg", dpi=144)
+
+    centers = [roi_center_yx(rr) for rr in ome.rois]
+
+    affine_mxs = [c21l.affine_matrix] * len(ome.rois)
+
+    if refine:
+        with warnings.catch_warnings():
+            warnings.simplefilter(action="ignore", category=RuntimeWarning)
+            affine_mxs = [
+                align_around_center(
+                    c21l, cc, crop_size=crop_size, downscale_factor=downscale_factor
+                )
+                for cc in tqdm.tqdm(centers, desc="Refine ROIs", ascii=True)
+            ]
+        # FIXME make aligner pickle-able for process based parallelization
+        # affine_mxs = joblib.Parallel(verbose=1, n_jobs=4)(
+        #     joblib.delayed(align_around_center)(cc) for cc in centers[:12]
+        # )
+    plt.close("all")
+
+    out_ome = make_roi_ome_xml(ome, affine_mxs, geometry_only=True)
+    method = "refine" if refine else "coarse"
+    out_name = (
+        f"{p1.name.split('.')[0]}-rois-from-{p2.name.split('.')[0]}-{method}.ome.xml"
+    )
+    with open(out_dir / out_name, "w") as f:
+        f.write(out_ome.to_xml())
+
+    if viz_napari:
+        ome_shapes = [rr.union[1] for rr in ome.rois]
+        shapes = [to_napari_shape(ss) for ss in ome_shapes]
+        v = view_coarse_align(r1, r2, c21l.affine_matrix)
+        for ss, mm in zip(shapes, affine_mxs):
+            v.add_shapes(
+                [ss[0]],
+                shape_type=ss[1],
+                affine=palom.img_util.to_napari_affine(mm),
+                face_color="#ffffff00",
+                edge_color="salmon",
+                edge_width=30,
+                name="roi-to-cycif",
+            )
+        v.add_shapes(
+            [ss[0] for ss in shapes],
+            shape_type=[ss[1] for ss in shapes],
+            affine=palom.img_util.to_napari_affine(c21l.affine_matrix),
+            face_color="#ffffff00",
+            edge_color="lightgreen",
+            edge_width=30,
+            name="roi-geomx",
+        )
+    return
+
+
+def run_batch(csv_path, print_args=True, dryrun=False, num_processes=4, **kwargs):
+    import csv
+    import inspect
+    import types
+    import pprint
+    import joblib
+
+    if print_args:
+        _args = [str(vv) for vv in inspect.signature(run_pair).parameters.values()]
+        print(f"\nFunction args\n{pprint.pformat(_args, indent=4)}\n")
+    _arg_types = inspect.get_annotations(run_pair)
+    arg_types = {}
+    for k, v in _arg_types.items():
+        if isinstance(v, types.UnionType):
+            v = v.__args__[0]
+        arg_types[k] = v
+
+    with open(csv_path) as f:
+        files = [
+            {kk: arg_types[kk](vv) for kk, vv in rr.items() if kk in arg_types}
+            for rr in csv.DictReader(f)
+        ]
+
+    if dryrun:
+        for ff in files:
+            pprint.pprint({**ff, **kwargs})
+            print()
+        return
+
+    joblib.Parallel(n_jobs=num_processes, verbose=1)(
+        joblib.delayed(run_pair)(**{**ff, **kwargs}) for ff in files
+    )
+
+
+if __name__ == "__main__":
+    import fire
+    import sys
+
+    fire.Fire({"run-pair": run_pair, "run-batch": run_batch})
+
+    if ("--viz_napari" in sys.argv) or ("-v" in sys.argv):
+        napari.run()
+
+    """
+    NAME
+        map-roi.py run-pair
+
+    SYNOPSIS
+        map-roi.py run-pair CYCIF_PATH GEOMX_PATH OUT_DIR <flags>
+
+    POSITIONAL ARGUMENTS
+        CYCIF_PATH
+            Type: str | pathlib.Path
+        GEOMX_PATH
+            Type: str | pathlib.Path
+        OUT_DIR
+            Type: str | pathlib.Path
+
+    FLAGS
+        -g, --geomx_roi_path=GEOMX_ROI_PATH
+            Type: Optional[str | pathlib.Path]
+            Default: None
+        -c, --crop_size=CROP_SIZE
+            Type: int
+            Default: 2000
+        -d, --downscale_factor=DOWNSCALE_FACTOR
+            Type: int
+            Default: 5
+        -r, --refine=REFINE
+            Type: bool
+            Default: False
+        -v, --viz_napari=VIZ_NAPARI
+            Type: bool
+            Default: False
+
+    
+    NAME
+        map-roi.py run-batch
+
+    SYNOPSIS
+        map-roi.py run-batch CSV_PATH <flags>
+
+    POSITIONAL ARGUMENTS
+        CSV_PATH
+
+    FLAGS
+        -p, --print_args=PRINT_ARGS
+            Default: True
+        -d, --dryrun=DRYRUN
+            Default: False
+        -n, --num_processes=NUM_PROCESSES
+            Default: 4
+        Additional flags are accepted.
+    """
