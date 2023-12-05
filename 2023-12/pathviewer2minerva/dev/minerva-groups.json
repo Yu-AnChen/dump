@@ -1,0 +1,39 @@
+{
+    "groups": [
+        {
+            "label": "ggg1",
+            "channels": [
+                {
+                    "color": "0000ff",
+                    "min": 0,
+                    "max": 0.05996795605401694,
+                    "label": "chanel1",
+                    "id": 0
+                },
+                {
+                    "color": "ff007f",
+                    "min": 0,
+                    "max": 0.009994659342336155,
+                    "label": "channel2",
+                    "id": 1
+                }
+            ],
+            "render": [
+                {
+                    "color": "0000ff",
+                    "min": 0,
+                    "max": 0.05996795605401694,
+                    "label": "chanel1",
+                    "id": 0
+                },
+                {
+                    "color": "ff007f",
+                    "min": 0,
+                    "max": 0.009994659342336155,
+                    "label": "channel2",
+                    "id": 1
+                }
+            ]
+        }
+    ]
+}
