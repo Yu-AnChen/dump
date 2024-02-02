@@ -109,7 +109,7 @@ def make_companion_ome(reader, best_zs):
         tiff_data_blocks = []
         planes = []
         for cc in range(metadata.num_channels):
-            UUID = ome_types.model.tiff_data.UUID(
+            UUID = ome_types.model.TiffData.UUID(
                 file_name=str(metadata.filename(ss, cc, best_zs[ss])),
                 value=uuid.uuid4().urn
             )
