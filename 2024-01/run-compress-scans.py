@@ -161,8 +161,10 @@ class ScansFolderEventHandler(AIOEventHandler):
             cmd_zstd = [
                 str(PATH_ZSTD),
                 "--force",
+                "--no-progress",
                 "-T4",
                 "-3",
+                "-v",
                 str(temp_filepath),
                 "-o",
                 str(compressed_filepath),
@@ -276,8 +278,6 @@ asyncio.get_event_loop().run_until_complete(watch_scan_folder(**DEFAULTS))
 
 """
 python -u "C:\rcpnl\_temp_compression\run-compression.py" | tee -a C:\rcpnl\_temp_compression\compress.log
-
-# https://github.com/peazip/PeaZip/releases/download/9.6.0/peazip_portable-9.6.0.WIN64.zip
 """
 
 """
