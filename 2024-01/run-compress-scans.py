@@ -260,7 +260,7 @@ async def watch_scan_folder(watch_dir, temp_dir, out_dir, recursive=True):
 
 FORMAT = "{datetime} | {pid:>10} | {msg}"
 
-PEAZIP_PATH = pathlib.Path(r"C:\Users\Public\Downloads\peazip_portable-9.6.0.WIN64")
+PEAZIP_PATH = pathlib.Path(r"C:\Users\Public\Downloads\peazip_portable-9.7.0.WIN64")
 PATH_7Z = PEAZIP_PATH / "res" / "bin" / "7z" / "7z.exe"
 PATH_ZSTD = PEAZIP_PATH / "res" / "bin" / "zstd" / "zstd.exe"
 PATH_PEA = PEAZIP_PATH / "pea.exe"
@@ -278,6 +278,7 @@ asyncio.get_event_loop().run_until_complete(watch_scan_folder(**DEFAULTS))
 
 """
 python -u "C:\rcpnl\_temp_compression\run-compression.py" | tee -a C:\rcpnl\_temp_compression\compress.log
+https://github.com/peazip/PeaZip/releases/download/9.7.0/peazip_portable-9.7.0.WIN64.zip
 """
 
 """
