@@ -4,7 +4,6 @@ import re
 import warnings
 
 import matplotlib.pyplot as plt
-import napari
 import numpy as np
 import ome_types
 import palom
@@ -86,6 +85,8 @@ def align_around_center(
 
 
 def view_coarse_align(reader1, reader2, affine_mx):
+    import napari
+
     v = napari.Viewer()
     kwargs = dict(visible=False, contrast_limits=(0, 50000), blending="additive")
     v.add_image(
@@ -138,7 +139,7 @@ def roi_center_yx(roi: ome_types.model.ROI):
     if shape.transform is not None:
         tt = shape.transform
         mx = [[tt.a00, tt.a01, tt.a02], [tt.a10, tt.a11, tt.a12], [0, 0, 1]]
-        tform = skimage.transform.AffineTransform(matrix=mx)
+        tform = skimage.transform.AffineTransform(matrix=np.array(mx))
         yx = np.fliplr(tform(np.fliplr([yx])))
     return np.array(yx)
 
@@ -234,6 +235,14 @@ def set_subplot_size(w, h, ax=None):
     ax.figure.set_size_inches(figw, figh)
 
 
+def get_reader(path):
+    path = pathlib.Path(path)
+    if path.suffix in [".svs", ".ndpi"]:
+        return palom.reader.SvsReader
+    else:
+        return palom.reader.OmePyramidReader
+
+
 def run_pair(
     cycif_path: str | pathlib.Path,
     geomx_path: str | pathlib.Path,
@@ -254,13 +263,16 @@ def run_pair(
     logger.remove()
     logger.add(out_dir / "log" / f"{pathlib.Path(cycif_path).stem}.log", level="INFO")
 
-    r1 = palom.reader.OmePyramidReader(cycif_path)
-    r2 = palom.reader.OmePyramidReader(geomx_path)
+    r1 = get_reader(cycif_path)(cycif_path)
+    r2 = get_reader(geomx_path)(geomx_path)
 
     p1 = r1.path
     p2 = r2.path
 
-    ome = ome_types.from_tiff(p2, parser="lxml", validate=False)
+    try:
+        ome = ome_types.from_tiff(p2, parser="lxml", validate=False)
+    except ValueError:
+        ome = ome_types.OME()
     if (ome.rois is None) or (len(ome.rois) == 0):
         print(
             f"No ROI detected in {p2}, which is expected to be an OME-TIFF exported"
@@ -381,6 +393,8 @@ if __name__ == "__main__":
     fire.Fire({"run-pair": run_pair, "run-batch": run_batch})
 
     if ("--viz_napari" in sys.argv) or ("-v" in sys.argv):
+        import napari
+
         napari.run()
 
     """
