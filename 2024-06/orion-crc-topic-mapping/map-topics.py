@@ -12,7 +12,7 @@ def run(topic_img_path, orion_path, cycif_path, topic_img_factor=100):
     r1 = palom.reader.OmePyramidReader(orion_path)
     r2 = palom.reader.OmePyramidReader(cycif_path)
 
-    aligner = palom.align.get_aligner(r1, r2, thumbnail_channel2=None)
+    aligner = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
     aligner.coarse_register_affine(
         n_keypoints=30_000,
         test_flip=True,
@@ -72,6 +72,84 @@ def run(topic_img_path, orion_path, cycif_path, topic_img_factor=100):
     return weighted_sum2
 
 
+import skimage.transform
+
+
+def run_v2(topic_img_path, orion_path, cycif_path, topic_img_pixel_size=100):
+    """
+    Map both orion and cycif image to the topic image coordinate.
+    The affine can then be used to transform cycif single cell coordinates.
+    """
+    timgs = tifffile.imread(topic_img_path)
+    r1 = palom.reader.OmePyramidReader(orion_path)
+    r2 = palom.reader.OmePyramidReader(cycif_path)
+
+    aligner = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
+    aligner.coarse_register_affine(
+        n_keypoints=30_000,
+        test_flip=True,
+        test_intensity_invert=False,
+        auto_mask=True,
+    )
+    # plt.close(plt.gcf())
+
+    tform_orion_to_timg = skimage.transform.AffineTransform(
+        scale=r1.pixel_size / topic_img_pixel_size
+        # The additional 0.5 pixel shift is needed after visual inspection
+    ) + skimage.transform.AffineTransform(translation=(-0.5, -0.5))
+    tform_cycif_to_timg = aligner.tform + tform_orion_to_timg
+
+    # viz using napari
+    v = napari.Viewer()
+    v.add_image(
+        timgs.sum(axis=0),
+        name="topic",
+        visible=False,
+    )
+    v.add_image(
+        [pp[0] for pp in r1.pyramid],
+        visible=False,
+        name="orion",
+        affine=palom.img_util.to_napari_affine(tform_orion_to_timg.params),
+    )
+    v.add_image(
+        [pp[0] for pp in r2.pyramid],
+        visible=False,
+        name="cycif",
+        affine=palom.img_util.to_napari_affine(tform_cycif_to_timg.params),
+    )
+
+    # viz using matplotlib
+    l1 = len(r1.pyramid) - 1
+    f1 = r1.level_downsamples[l1]
+    t1 = r1.pyramid[l1][0].compute()
+    tt1 = skimage.transform.warp(
+        t1,
+        (skimage.transform.AffineTransform(scale=f1) + tform_orion_to_timg).inverse,
+        output_shape=timgs[0].shape,
+    )
+
+    l2 = len(r2.pyramid) - 1
+    f2 = r2.level_downsamples[l2]
+    t2 = r2.pyramid[l2][0].compute()
+    tt2 = skimage.transform.warp(
+        t2,
+        (skimage.transform.AffineTransform(scale=f2) + tform_cycif_to_timg).inverse,
+        output_shape=timgs[0].shape,
+    )
+
+    _, axs = plt.subplots(1, 3, sharex=True, sharey=True)
+    for ax, ii, nn in zip(
+        axs,
+        [timgs.sum(axis=0), np.log1p(tt1), np.log1p(tt2)],
+        ["topic", "orion", "cycif"],
+    ):
+        ax.imshow(ii)
+        ax.set_title(nn)
+        ax.axis("off")
+    return
+
+
 timg_paths = r"""
 U:\YC-20230126-squidpy_demo\C01-topics.ome.tif
 U:\YC-20230126-squidpy_demo\C02-topics.ome.tif
@@ -106,17 +184,16 @@ Z:\JL503_JERRY\192-CRCWSI_Tumor-2021JUL\TNPCRC_10.ome.tif
 Z:\JL503_JERRY\192-CRCWSI_Tumor-2021JUL\TNPCRC_11.ome.tif
 """.strip().split("\n")
 timg_factor = [
-    100*0.325/0.320,
-    100*0.325/0.320,
-    100*0.325/0.320,
-    100*0.325/0.320,
+    100 * 0.325 / 0.320,
+    100 * 0.325 / 0.320,
+    100 * 0.325 / 0.320,
+    100 * 0.325 / 0.320,
     100,
     100,
     100,
     100,
-    100
+    100,
 ]
-
 
 
 jerry_paths = r"""
