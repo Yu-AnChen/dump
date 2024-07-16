@@ -1,0 +1,4 @@
+conda create -n valis -c conda-forge python=3.10 openjdk openslide libvips pyqt maven
+conda activate valis
+python -m pip install --use-pep517 pyvips
+python -m pip install valis-wsi

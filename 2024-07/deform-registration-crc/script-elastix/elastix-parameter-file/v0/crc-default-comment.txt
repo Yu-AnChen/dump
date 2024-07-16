@@ -1,0 +1,40 @@
+(ASGDParameterEstimationMethod "DisplacementDistribution")
+(AutomaticParameterEstimation "true")
+(CheckNumberOfSamples "true")
+(DefaultPixelValue 0)
+(FinalBSplineInterpolationOrder 1)
+(FixedImagePyramid "FixedRecursiveImagePyramid")
+(GridSpacingSchedule 8.0 4.0 2.0 1.0)
+(HowToCombineTransforms "Compose")
+(ImageSampler "RandomCoordinate")
+(Interpolator "BSplineInterpolator")
+(MaximumNumberOfSamplingAttempts 8)
+(MovingImagePyramid "MovingRecursiveImagePyramid")
+(NewSamplesEveryIteration "true")
+(NumberOfResolutions 4)
+(Optimizer "AdaptiveStochasticGradientDescent")
+(Registration "MultiMetricMultiResolutionRegistration")
+(ResampleInterpolator "FinalBSplineInterpolator")
+(Resampler "DefaultResampler")
+(ResultImageFormat "nii")
+(Transform "RecursiveBSplineTransform")
+(UseRandomSampleRegion "true")
+(WriteIterationInfo "false")
+
+// must set this to true to get the warpped image
+(WriteResultImage "true")
+
+// higher weight on the bending energy panelty to reduce distortion
+(Metric "AdvancedMattesMutualInformation" "TransformBendingEnergyPenalty")
+(Metric0Weight 1.0)
+(Metric1Weight 100.0)
+
+// these should be pixel-size & image size related
+(FinalGridSpacingInVoxels 80.0 80.0)
+(NumberOfSamplesForExactGradient 10000)
+// this works great for CRC02
+(NumberOfSpatialSamples 5000)
+(SampleRegionSize 200)
+
+// number of iterations for global minima
+(MaximumNumberOfIterations 1000)
