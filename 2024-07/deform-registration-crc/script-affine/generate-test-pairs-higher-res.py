@@ -104,6 +104,7 @@ for oo, cc, nn in zip(orion_paths[5:6], cycif_paths[5:6], case_number[5:6]):
     aligner = palom.align.Aligner(
         ref_img=r1.pyramid[5][0],
         moving_img=r2.pyramid[4][0],
+        # do feature detection and matching at resolution of ~40 µm/pixel
         ref_thumbnail=palom.img_util.cv2_downscale_local_mean(r1.pyramid[6][0], 2),
         moving_thumbnail=palom.img_util.cv2_downscale_local_mean(r2.pyramid[5][0], 2),
         ref_thumbnail_down_factor=2 ** (7 - 5),
@@ -124,7 +125,7 @@ for oo, cc, nn in zip(orion_paths[5:6], cycif_paths[5:6], case_number[5:6]):
         preserve_range=True,
         output_shape=ref.shape,
     )
-    np.savetxt(f"C{nn:02}-affine-matrix.csv", aligner.affine_matrix, delimiter=',')
+    np.savetxt(f"C{nn:02}-affine-matrix.csv", aligner.affine_matrix, delimiter=",")
     tifffile.imwrite(f"C{nn:02}-ref.tif", ref, compression="zlib")
     tifffile.imwrite(
         f"C{nn:02}-moving.tif",
@@ -133,6 +134,11 @@ for oo, cc, nn in zip(orion_paths[5:6], cycif_paths[5:6], case_number[5:6]):
     )
 
 
+# ---------------------------------------------------------------------------- #
+#                         warp with displacement field                         #
+# ---------------------------------------------------------------------------- #
+
+# scikit-image use "float64" internally
 my, mx = np.mgrid[: ref.shape[0], : ref.shape[1]].astype("float32")
 
 tmy = skimage.transform.warp(
