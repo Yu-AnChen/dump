@@ -69,14 +69,13 @@ def make_tissue_mask(
     img_pyramid_downscale_factor: int,
     dilation_radius: int,
     plot: bool = False,
-    return_entropy_thumbnail: bool = False,
     level_center: float = -0.2,
     level_adjust: int = 0,
 ):
     assert thumbnail_level >= 0
     assert img_pyramid_downscale_factor >= 1
     assert dilation_radius >= 0
-    assert (level_center >= -0.5) & (level_center <= 0.5)
+    # assert (level_center >= -0.5) & (level_center <= 0.5)
 
     assert level_adjust in np.arange(-2, 3, 1)
 
@@ -96,66 +95,117 @@ def make_tissue_mask(
     thumbnail = np.log1p(thumbnail.sum(axis=0))
     entropy_thumbnail = local_entropy(thumbnail)
 
-    erange = np.subtract(*np.percentile(entropy_thumbnail, [99, 1]))
+    erange = np.ptp(entropy_thumbnail)
     _threshold = skimage.filters.threshold_otsu(entropy_thumbnail)
+    _max = entropy_thumbnail.max() - 0.1 * erange
+    _min = entropy_thumbnail.min() + 0.1 * erange
+    _threshold = np.clip(_threshold, _min, _max)
+
+    level_center = np.clip(
+        level_center, (_min - _threshold) / erange, (_max - _threshold) / erange
+    )
+
+    # forcing threshold to be within 10th and 90th percent of the range
     _threshold += level_center * erange
     print(_threshold)
-    threshold = _threshold + 0.1 * level_adjust * erange
-    threshold = np.clip(threshold, entropy_thumbnail.min(), entropy_thumbnail.max())
 
-    mask = entropy_thumbnail > threshold
-    skimage.morphology.binary_dilation(
-        mask, footprint=skimage.morphology.disk(radius=dilation_radius), out=mask
+    thresholds = np.concatenate(
+        [
+            np.linspace(entropy_thumbnail.min(), _threshold, 4)[1:],
+            np.linspace(_threshold, entropy_thumbnail.max(), 4)[1:-1],
+        ]
     )
+    level_adjusts = np.arange(-2, 3, 1)
+    masks = entropy_img_to_masks(entropy_thumbnail, thresholds, dilation_radius)
+    mask = masks[list(level_adjusts).index(level_adjust)]
+
     if plot:
-        masks = entropy_img_to_masks(
-            entropy_thumbnail, _threshold, 5, dilation_radius=dilation_radius
+        fig = plot_tissue_mask(
+            thumbnail,
+            entropy_thumbnail,
+            masks,
+            thresholds,
+            list(level_adjusts).index(level_adjust),
         )
-        fig = _plot_tissue_mask(thumbnail, mask, entropy_thumbnail, masks=masks)
-    if return_entropy_thumbnail:
-        return mask, entropy_thumbnail
-    return mask
-
-
-def entropy_img_to_masks(entropy_img, threshold_center, num_levels, dilation_radius=2):
-    assert num_levels >= 1
-    num_levels = 2 * (num_levels // 2) + 1  # must be symmetrical
-    erange = np.subtract(*np.percentile(entropy_img, [99, 1]))
-
-    adjustments = np.arange(num_levels) - np.arange(num_levels).mean()
-    thresholds = adjustments * 0.1 * erange + threshold_center
-
-    mask = np.full(entropy_img.shape, adjustments.min() - 1, dtype="int8")
-    for tt in thresholds:
-        mask += skimage.morphology.binary_dilation(
-            entropy_img > tt, footprint=skimage.morphology.disk(radius=dilation_radius)
-        )
+        fig.suptitle(reader.path.name)
 
     return mask
 
 
-def _plot_mask_levels(img, mask, num_levels, ax=None, tick_labels=None):
+def entropy_img_to_masks(entropy_img, thresholds, dilation_radius):
+    masks = np.full((len(thresholds), *entropy_img.shape), fill_value=False, dtype=bool)
+    for idx, tt in enumerate(thresholds):
+        masks[idx] = skimage.morphology.binary_dilation(
+            entropy_img > tt,
+            footprint=skimage.morphology.disk(radius=dilation_radius),
+        )
+    return masks
+
+
+def plot_tissue_mask(img, entropy_img, masks, thresholds, selected_mask_idx):
+    import matplotlib.pyplot as plt
+
+    # set contrast min to min value that is not 0
+    vimg = skimage.exposure.rescale_intensity(
+        img,
+        in_range=(img[img > 0].min(), img.max()),
+        out_range="float",
+    )
+    # pad images for mask outline drawing
+    pad_size = np.ceil(np.max(img.shape) * 0.01).astype("int")
+    vimg = np.pad(vimg, pad_size, constant_values=0)
+    ventropy = np.pad(entropy_img, pad_size, constant_values=entropy_img.min())
+    vmasks = np.pad(
+        masks,
+        [(0, 0), (pad_size, pad_size), (pad_size, pad_size)],
+        constant_values=False,
+    )
+    vmask = vmasks[selected_mask_idx]
+
+    subplot_shape = (2, 1)
+    if np.divide(*img.shape) > 1.2:
+        subplot_shape = (1, 2)
+
+    fig, axs = plt.subplots(*subplot_shape, sharex=True, sharey=True)
+
+    axs[0].imshow(vimg, cmap="cividis")
+    axs[0].contour(vmask, levels=[0.5], colors=["w"], linewidths=1)
+    # axs[1].imshow(ventropy, cmap="cividis", interpolation="none")
+
+    _plot_entropy_mask_levels(
+        ventropy, vmasks, thresholds, selected_mask_idx, img=vimg, ax=axs[1]
+    )
+    return fig
+
+
+def _plot_entropy_mask_levels(
+    entropy_img, masks, thresholds, selected_mask_idx=None, img=None, ax=None
+):
+    import itertools
+
     import matplotlib.cm
     import matplotlib.pyplot as plt
     from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
-    assert num_levels % 2 == 1
-    assert num_levels >= 3
+    assert len(masks) == len(thresholds) == 5
 
-    # levels = np.arange(-0.5 * (num_levels - 1), 0.5 * (num_levels - 1) + 1, 1)
-    # levels = np.arange(0.5, mask.max() + 1, 1)
-    levels = np.arange(num_levels) - np.arange(num_levels).mean()
-    ccmm = matplotlib.cm.bwr_r
-    ccmm.set_under("k")
-    ccmm.set_over(matplotlib.cm.bwr_r(1.0))
+    levels = np.arange(7) - 0.5
+    tick_labels = np.arange(5) - 2
+
+    if selected_mask_idx is None:
+        selected_mask_idx = 2
+    assert selected_mask_idx in range(5)
 
     if ax is None:
         _, ax = plt.subplots()
     fig = ax.get_figure()
 
+    if img is None:
+        img = [[0]]
     ax.imshow(np.log1p(img), cmap="gray")
-    cplot = ax.contourf(mask - 0.5, levels=levels, cmap=ccmm, alpha=0.5, extend="both")
 
+    ax.contourf(masks.sum(axis=0), cmap="coolwarm_r", levels=levels, alpha=0.75)
+    ax.contour(masks[selected_mask_idx], levels=[0.5], colors=["w"], linewidths=1)
     axins = inset_axes(
         ax,
         width=0.1,  # width: .1 inch
@@ -165,68 +215,20 @@ def _plot_mask_levels(img, mask, num_levels, ax=None, tick_labels=None):
         bbox_transform=ax.transAxes,
         borderpad=0,
     )
-    cax = fig.colorbar(cplot, cax=axins, ticks=levels[:-1])
-    if tick_labels is not None:
-        if len(tick_labels) == len(levels[:-1]):
-            # cax.ax.set_yticklabels(["--", "-", "", "+", "++"])
-            cax.ax.set_yticklabels(tick_labels)
+    colors = matplotlib.cm.coolwarm_r(np.linspace(0, 1, 6), alpha=0.75)
+    yys = [entropy_img.min()] + list(thresholds) + [entropy_img.max()]
+
+    for pp, cc in zip(itertools.pairwise(yys), colors):
+        axins.fill_between([0, 1], *pp, color=cc, step="post")
+
+    axins.set_xlim(0, 1)
+    axins.set_ylim(yys[0], yys[-1])
+    axins.axes.yaxis.tick_right()
+    axins.set_yticks(yys[1:-1], labels=tick_labels)
+    axins.set_xticks([])
+    axins.axhline(thresholds[selected_mask_idx], color="w", linewidth=3)
+
     return fig
-
-
-def _plot_tissue_mask(img, mask, entropy_img, masks=None):
-    import matplotlib.pyplot as plt
-    import matplotlib.cm
-
-    # set contrast min to min value that is not 0
-    vimg = skimage.exposure.rescale_intensity(
-        img,
-        in_range=(img[img > 0].min(), img.max()),
-        out_range="float",
-    )
-    # pad images for mask outline drawing
-    vimg = np.pad(vimg, 2, constant_values=0)
-    ventropy = np.pad(entropy_img, 2, constant_values=entropy_img.min())
-    vmask = np.pad(mask, 2, constant_values=0)
-    if masks is not None:
-        vmasks = np.pad(masks, 2, constant_values=masks.min())
-        fig, axs = plt.subplots(1, 3, sharex=True, sharey=True)
-        _plot_mask_levels(
-            vimg, vmasks, num_levels=2 * np.abs(masks.min()) - 1, ax=axs[2]
-        )
-    else:
-        # one figure with two subplots
-        fig, axs = plt.subplots(1, 2, sharex=True, sharey=True)
-    vimg = matplotlib.cm.cividis(vimg)[..., :3]
-    outline = skimage.segmentation.find_boundaries(vmask, mode="thick", connectivity=2)
-    # use magenta as outline color
-    vimg[..., [0, 2]] += outline[..., np.newaxis]
-    axs[0].imshow(np.clip(vimg, 0, 1), interpolation="none")
-    axs[1].imshow(ventropy, cmap="cividis", interpolation="none")
-    fig.tight_layout()
-    return fig
-
-
-def _make_tissue_mask(img_path: str | pathlib.Path, thumbnail_factor, dilation_radius):
-    reader = palom.reader.OmePyramidReader(img_path)
-    # FIXME assuming 2x downsizing in the pyramid
-    LEVEL = int(np.log2(thumbnail_factor))
-    if LEVEL > len(reader.pyramid) - 1:
-        LEVEL = len(reader.pyramid) - 1
-    _thumbnail = reader.pyramid[LEVEL][:]
-
-    level_diff = int(np.log2(thumbnail_factor)) - LEVEL
-    thumbnail = np.array(
-        [
-            palom.img_util.cv2_downscale_local_mean(cc, 2**level_diff)
-            for cc in _thumbnail
-        ]
-    )
-    entropy_thumbnail = local_entropy(np.log1p(thumbnail.sum(axis=0)))
-    mask = entropy_thumbnail > skimage.filters.threshold_otsu(entropy_thumbnail)
-    skimage.morphology.binary_dilation(
-        mask, footprint=skimage.morphology.disk(radius=dilation_radius), out=mask
-    )
-    return mask
 
 
 def write_masked(img_path, output_path, tissue_mask, mask_upscale_factor):
