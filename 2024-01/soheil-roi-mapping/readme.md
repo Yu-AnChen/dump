@@ -35,7 +35,7 @@
    For example -
 
     ```bash
-    python map-geomx-roi.py run-batch pairs.csv --out_dir hits-server/path/to/output/rois
+    python map-geomx-roi.py run-batch pairs.csv --out_dir hits-server/path/to/output/rois --num_processes 2
     ```
 
     To setup the execution environment, follow the [instructions to install

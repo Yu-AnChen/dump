@@ -1,7 +1,6 @@
 import copy
 import pathlib
 import re
-import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,9 +16,10 @@ def align_around_center(
     center_yx,
     center_in="moving",
     crop_size=2000,
-    downscale_factor=5,
+    downscale_factor=8,
     valid_cutoff=0.1,
     max_crop_size=10_000,
+    plot_match=False,
 ):
     assert valid_cutoff > 0
     crop_size = int(crop_size)
@@ -49,19 +49,21 @@ def align_around_center(
             center_in=center_in,
             crop_size=2 * crop_size,
             downscale_factor=2 * downscale_factor,
+            plot_match=plot_match,
         )
     simg1 = palom.img_util.cv2_downscale_local_mean(img1, downscale_factor)
     simg2 = palom.img_util.cv2_downscale_local_mean(img2, downscale_factor)
     refined_mx = palom.register.feature_based_registration(
         simg1,
         simg2,
-        plot_match_result=True,
+        plot_match_result=plot_match,
         n_keypoints=20_000,
         plot_individual_result=False,
     )
-    plt.gca().set_title(
-        f"Center ({center_in}): ({_center_yx[0]:.2f}, {_center_yx[1]:.2f})"
-    )
+    if plot_match:
+        plt.gca().set_title(
+            f"Center ({center_in}): ({_center_yx[0]:.2f}, {_center_yx[1]:.2f})"
+        )
     if np.linalg.norm(np.diag(refined_mx) - 1) > valid_cutoff:
         return align_around_center(
             aligner,
@@ -69,6 +71,7 @@ def align_around_center(
             center_in=center_in,
             crop_size=2 * crop_size,
             downscale_factor=2 * downscale_factor,
+            plot_match=plot_match,
         )
     refined_mx = np.vstack([refined_mx, [0, 0, 1]])
     Affine = skimage.transform.AffineTransform
@@ -141,7 +144,7 @@ def roi_center_yx(roi: ome_types.model.ROI):
         mx = [[tt.a00, tt.a01, tt.a02], [tt.a10, tt.a11, tt.a12], [0, 0, 1]]
         tform = skimage.transform.AffineTransform(matrix=np.array(mx))
         yx = np.fliplr(tform(np.fliplr([yx])))
-    return np.array(yx)
+    return np.array(yx).flatten()
 
 
 def to_napari_shape(roi):
@@ -247,11 +250,12 @@ def run_pair(
     cycif_path: str | pathlib.Path,
     geomx_path: str | pathlib.Path,
     out_dir: str | pathlib.Path,
-    geomx_roi_path: str | pathlib.Path = None,
+    geomx_roi_path: str | pathlib.Path | None = None,
     crop_size: int = 2000,
     downscale_factor: int = 5,
     refine: bool = False,
     viz_napari: bool = False,
+    num_processes: int = 1,
 ):
     from loguru import logger
 
@@ -270,7 +274,7 @@ def run_pair(
     p2 = r2.path
 
     try:
-        ome = ome_types.from_tiff(p2, parser="lxml", validate=False)
+        ome = ome_types.from_tiff(p2, validate=False)
     except ValueError:
         ome = ome_types.OME()
     if (ome.rois is None) or (len(ome.rois) == 0):
@@ -281,7 +285,7 @@ def run_pair(
         if geomx_roi_path is None:
             print("`geomx_roi_path` is not specified")
             return
-        ome = ome_types.from_xml(geomx_roi_path, parser="lxml", validate=False)
+        ome = ome_types.from_xml(geomx_roi_path, validate=False)
         if (ome.rois is None) or (len(ome.rois) == 0):
             print(f"No ROI detected in {geomx_roi_path}, either")
             return
@@ -298,25 +302,53 @@ def run_pair(
     # use 0.5 inch on the top for figure title
     fig.subplots_adjust(top=1 - 0.5 / fig.get_size_inches()[1])
     save_all_figs(out_dir=out_dir / "qc", format="jpg", dpi=144)
+    plt.close("all")
 
     centers = [roi_center_yx(rr) for rr in ome.rois]
 
     affine_mxs = [c21l.affine_matrix] * len(ome.rois)
 
     if refine:
-        with warnings.catch_warnings():
-            warnings.simplefilter(action="ignore", category=RuntimeWarning)
-            affine_mxs = [
-                align_around_center(
-                    c21l, cc, crop_size=crop_size, downscale_factor=downscale_factor
+        import joblib  # type: ignore
+
+        num_processes = np.clip(
+            num_processes, 1, np.ceil(joblib.cpu_count() / 4).astype("int")
+        )
+        num_processes = int(num_processes)
+        _mx = c21l.coarse_affine_matrix
+
+        def _wrap(*args, **kwargs):
+            from loguru import logger
+
+            logger.remove()
+            _r1 = get_reader(cycif_path)(cycif_path)
+            _r2 = get_reader(geomx_path)(geomx_path)
+            _aligner = palom.align.get_aligner(_r1, _r2, thumbnail_level2=None)
+            _aligner.coarse_affine_matrix = _mx
+            mx = align_around_center(_aligner, *args, **kwargs)
+            return mx
+
+        if num_processes > 1:
+            # FIXME make aligner pickle-able for process based parallelization
+            affine_mxs = joblib.Parallel(verbose=5, n_jobs=num_processes)(
+                joblib.delayed(_wrap)(
+                    cc,
+                    crop_size=crop_size,
+                    downscale_factor=downscale_factor,
+                    plot_match=False,
                 )
-                for cc in tqdm.tqdm(centers, desc="Refine ROIs", ascii=True)
+                for cc in centers[:]
+            )
+        else:
+            affine_mxs = [
+                _wrap(
+                    cc,
+                    crop_size=crop_size,
+                    downscale_factor=downscale_factor,
+                    plot_match=False,
+                )
+                for cc in tqdm.tqdm(centers)
             ]
-        # FIXME make aligner pickle-able for process based parallelization
-        # affine_mxs = joblib.Parallel(verbose=1, n_jobs=4)(
-        #     joblib.delayed(align_around_center)(cc) for cc in centers[:12]
-        # )
-    plt.close("all")
 
     out_ome = make_roi_ome_xml(ome, affine_mxs, geometry_only=True)
     method = "refine" if refine else "coarse"
@@ -352,12 +384,11 @@ def run_pair(
     return
 
 
-def run_batch(csv_path, print_args=True, dryrun=False, num_processes=4, **kwargs):
+def run_batch(csv_path, print_args=True, dryrun=False, **kwargs):
     import csv
     import inspect
     import types
     import pprint
-    import joblib
 
     if print_args:
         _args = [str(vv) for vv in inspect.signature(run_pair).parameters.values()]
@@ -381,9 +412,8 @@ def run_batch(csv_path, print_args=True, dryrun=False, num_processes=4, **kwargs
             print()
         return
 
-    joblib.Parallel(n_jobs=num_processes, verbose=1)(
-        joblib.delayed(run_pair)(**{**ff, **kwargs}) for ff in files
-    )
+    for ff in files:
+        run_pair(**{**ff, **kwargs})
 
 
 if __name__ == "__main__":
@@ -399,10 +429,10 @@ if __name__ == "__main__":
 
     """
     NAME
-        map-roi.py run-pair
+        map-geomx-roi.py run-pair
 
     SYNOPSIS
-        map-roi.py run-pair CYCIF_PATH GEOMX_PATH OUT_DIR <flags>
+        map-geomx-roi.py run-pair CYCIF_PATH GEOMX_PATH OUT_DIR <flags>
 
     POSITIONAL ARGUMENTS
         CYCIF_PATH
@@ -414,7 +444,7 @@ if __name__ == "__main__":
 
     FLAGS
         -g, --geomx_roi_path=GEOMX_ROI_PATH
-            Type: Optional[str | pathlib.Path]
+            Type: Optional[str | pathlib...
             Default: None
         -c, --crop_size=CROP_SIZE
             Type: int
@@ -428,13 +458,16 @@ if __name__ == "__main__":
         -v, --viz_napari=VIZ_NAPARI
             Type: bool
             Default: False
+        -n, --num_processes=NUM_PROCESSES
+            Type: int
+            Default: 1
 
     
     NAME
-        map-roi.py run-batch
+        map-geomx-roi.py run-batch
 
     SYNOPSIS
-        map-roi.py run-batch CSV_PATH <flags>
+        map-geomx-roi.py run-batch CSV_PATH <flags>
 
     POSITIONAL ARGUMENTS
         CSV_PATH
@@ -444,7 +477,5 @@ if __name__ == "__main__":
             Default: True
         -d, --dryrun=DRYRUN
             Default: False
-        -n, --num_processes=NUM_PROCESSES
-            Default: 4
         Additional flags are accepted.
     """
