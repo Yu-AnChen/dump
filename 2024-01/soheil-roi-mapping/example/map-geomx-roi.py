@@ -291,7 +291,7 @@ def run_pair(
             return
 
     c21l = palom.align.get_aligner(r1, r2, thumbnail_level2=None)
-    c21l.coarse_register_affine(n_keypoints=10000)
+    c21l.coarse_register_affine(n_keypoints=10000, test_flip=True, test_intensity_invert=True)
 
     fig, ax = plt.gcf(), plt.gca()
     fig.suptitle(f"{p2.name} (coarse alignment)", fontsize=8)
