@@ -1,51 +1,38 @@
-import skimage.measure
-import numpy as np
 import dask.array as da
-import dask
-import dask.diagnostics
+import joblib
+import numpy as np
+import skimage.measure
+import skimage.segmentation
+import tifffile
+import zarr
 
 _all_mask_props = [
-    "label", "centroid", "area",
-    "major_axis_length", "minor_axis_length",
-    "eccentricity", "solidity", "extent", "orientation"
+    "label",
+    "centroid",
+    "area",
+    "major_axis_length",
+    "minor_axis_length",
+    "eccentricity",
+    "solidity",
+    "extent",
+    "orientation",
 ]
 
-size = 50_000
-
-# ---------------------------------------------------------------------------- #
-#                             Run with scikit-image                            #
-# ---------------------------------------------------------------------------- #
-tmask = np.arange(size, dtype=np.int32).reshape(1, size)
-
-_ = skimage.measure.regionprops_table(tmask, properties=_all_mask_props)
-
-
-# ---------------------------------------------------------------------------- #
-#                   Process-based parallelization using dask                   #
-# ---------------------------------------------------------------------------- #
-# this doesn't seem to matter
-import threadpoolctl
-threadpoolctl.threadpool_limits(1)
-
-damask = da.arange(size, dtype=np.int32, chunks=1000).reshape(1, size)
-results = [
-    dask.delayed(skimage.measure.regionprops_table)(b, properties=_all_mask_props)
-    for b in damask.blocks.ravel()
-]
-with dask.diagnostics.ProgressBar():
-    _ = dask.compute(*results, scheduler='processes', num_workers=4)
-
-
+# _all_mask_props = [
+#     "label",
+#     "centroid",
+#     "area",
+# ]
 
 # ---------------------------------------------------------------------------- #
 #                      Find out how much overlap is needed                     #
 # ---------------------------------------------------------------------------- #
-import skimage.segmentation
+
 
 def edger_bbox_to_edge(mask):
-    '''
+    """
     For objects touching edges, compute their distances to the touching front
-    '''
+    """
     mask = np.array(mask)
     h, w = mask.shape
     cleared = skimage.segmentation.clear_border(mask)
@@ -55,87 +42,142 @@ def edger_bbox_to_edge(mask):
     # return mask
     results = skimage.measure.regionprops_table(mask)
     rs = results
-    return np.concatenate([
-        rs['bbox-2'][rs['bbox-0'] == 0],
-        rs['bbox-3'][rs['bbox-1'] == 0],
-        h - rs['bbox-0'][rs['bbox-2'] == h],
-        w - rs['bbox-1'][rs['bbox-3'] == w],
-    ])
+    return np.concatenate(
+        [
+            rs["bbox-2"][rs["bbox-0"] == 0],
+            rs["bbox-3"][rs["bbox-1"] == 0],
+            h - rs["bbox-0"][rs["bbox-2"] == h],
+            w - rs["bbox-1"][rs["bbox-3"] == w],
+        ]
+    )
 
 
-import palom
+img_path = "/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/ORION-CRC04-manual-cell-type/segmentation/cellRing.ome.tif"
 
-img_path = '/mnt/orion/Mercury-3/20230227/B6_8EOHXW/segmentation/B6_8EOHXW/nucleiRing.ome.tif'
-reader = palom.reader.OmePyramidReader(img_path)
-mask = reader.pyramid[0][0]
-_all_mask_props = [
-    "label", "centroid", "area",
-]
-full_result = skimage.measure.regionprops_table(np.array(mask), properties=_all_mask_props)
-full_result.keys()
+zimg = zarr.open(tifffile.imread(img_path, aszarr=True, level=0), mode="r")
+mask = da.from_zarr(zimg)
+## %%time
+full_result = skimage.measure.regionprops_table(
+    np.array(mask), properties=_all_mask_props
+)
+
+# ---------------------------------------------------------------------------- #
+#                       compute amount of overlap needed                       #
+# ---------------------------------------------------------------------------- #
+block_size = 1024 * 4
+nr, nc = np.ceil(np.divide(zimg.shape, block_size)).astype("int")
+ri, ci = np.indices([nr, nc]).reshape(2, -1)
+
+rs = block_size * ri
+cs = block_size * ci
+re = block_size * (ri + 1)
+ce = block_size * (ci + 1)
 
 
-edge_size = [dask.delayed(edger_bbox_to_edge)(m) for m in mask.blocks.ravel()]
-with dask.diagnostics.ProgressBar():
-    # FIXME should use process-based parallelization
-    edge_size = dask.compute(*edge_size)
+def wrap_edger(rrs, rre, ccs, cce):
+    zimg = zarr.open(tifffile.imread(img_path, aszarr=True, level=0), mode="r")
+    mm = zimg[rrs:rre, ccs:cce]
+    return edger_bbox_to_edge(mm)
 
+
+## %%time
+edge_size = joblib.Parallel(verbose=1, backend="loky", n_jobs=4, return_as="list")(
+    joblib.delayed(wrap_edger)(rrs, rre, ccs, cce)
+    for rrs, rre, ccs, cce in zip(*np.array([rs, re, cs, ce]))
+)
 es = np.max([np.max(e) for e in edge_size])
+es = 16 * np.ceil(es / 16).astype("int")
 
-omask = da.overlap.overlap(mask, 48, 'none')
-block_results = [dask.delayed(skimage.measure.regionprops_table)(b, properties=_all_mask_props) for b in omask.blocks.ravel()]
-
-with dask.diagnostics.ProgressBar():
-    # FIXME should use process-based parallelization
-    block_results = dask.compute(*block_results)
-
-import pandas as pd
-
-df_block = (pd.concat([pd.DataFrame(r) for r in block_results])
-    .sort_values(['label', 'area'])
-    .drop_duplicates(keep='last', subset='label')
-    .set_index('label'))
-
-
-df = pd.DataFrame(full_result).set_index('label')
-# compare result
-np.sum(df_block.area != df.area)
-
-
-# use block_info to get offsets for cropping (process parallelization)
-# and apply coordinates offsets
-def test(b, block_info=None):
-    print(block_info[None]['array-location'])
-    return np.atleast_2d(1)
-
-mask.map_blocks(test, dtype=int).compute()
 
 # ---------------------------------------------------------------------------- #
 #                      joblib for process parallelization                      #
 # ---------------------------------------------------------------------------- #
-rechunked = mask.rechunk(2048)
+rechunked = mask.rechunk(1024 * 4)
 rr, cc = np.indices(rechunked.numblocks)
 rsize, csize = rechunked.chunksize
 
-es = 48
+es = 128
 rs = np.clip(rr * rsize - es, 0, mask.shape[0])
-re = np.clip((rr+1) * rsize + es, 0, mask.shape[0])
+re = np.clip((rr + 1) * rsize + es, 0, mask.shape[0])
 cs = np.clip(cc * csize - es, 0, None)
-ce = np.clip((cc+1) * csize + es, None, mask.shape[1])
+ce = np.clip((cc + 1) * csize + es, None, mask.shape[1])
 
-import joblib
 
 def wrap(rrs, rre, ccs, cce):
-    mm = reader.pyramid[0][0][rrs:rre, ccs:cce]
-    result = skimage.measure.regionprops_table(mm.compute(), properties=_all_mask_props)
-    result['offset_row'] = np.ones(len(result['label']), dtype=int) * rrs
-    result['offset_col'] = np.ones(len(result['label']), dtype=int) * ccs
+    zimg = zarr.open(tifffile.imread(img_path, aszarr=True, level=0), mode="r")
+    mm = zimg[rrs:rre, ccs:cce]
+    result = skimage.measure.regionprops_table(mm, properties=_all_mask_props)
+    result["offset_row"] = np.ones(len(result["label"]), dtype=int) * rrs
+    result["offset_col"] = np.ones(len(result["label"]), dtype=int) * ccs
     return result
-_ = joblib.Parallel(verbose=1, backend='loky', n_jobs=12, return_as='list')(
+
+
+## %%time
+block_results = joblib.Parallel(verbose=1, backend="loky", n_jobs=4, return_as="list")(
     joblib.delayed(wrap)(rrs, rre, ccs, cce)
     for rrs, rre, ccs, cce in zip(*np.array([rs, re, cs, ce]).reshape(4, -1))
 )
 
+import pandas as pd
+
+df_block = (
+    pd.concat([pd.DataFrame(r) for r in block_results])
+    .sort_values(["label", "area"])
+    .drop_duplicates(keep="last", subset="label")
+    .set_index("label")
+)
+
+df = pd.DataFrame(full_result).set_index("label")
+# compare result
+np.sum(df_block.area != df.area)
+
+
 # ---------------------------------------------------------------------------- #
-#                         Next is to monitor RAM usage                         #
+#                       quantify channel intensity props                       #
 # ---------------------------------------------------------------------------- #
+orion_img_path = "/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/ORION-CRC04-manual-cell-type/image/P37_S32_A24_C59kX_E15@20220106_014630_553652-zlib-viz-300.ome.tiff"
+
+
+def quartiles(regionmask, intensity):
+    return np.percentile(intensity[regionmask], q=(25, 50, 75))
+
+
+def wrap_int(rrs, rre, ccs, cce, channel=0):
+    zimg = zarr.open(tifffile.imread(img_path, aszarr=True, level=0), mode="r")
+    _img = zarr.open(tifffile.imread(orion_img_path, aszarr=True, level=0), mode="r")
+    mm = zimg[rrs:rre, ccs:cce]
+    img = _img[channel, rrs:rre, ccs:cce]
+    result = skimage.measure.regionprops_table(
+        mm,
+        intensity_image=img,
+        properties=("label", "intensity_mean"),
+        extra_properties=(quartiles,),
+    )
+    return result
+
+
+rechunked = mask.rechunk(1024 * 4)
+rr, cc = np.indices(rechunked.numblocks)
+rsize, csize = rechunked.chunksize
+
+es = 128
+rs = np.clip(rr * rsize - es, 0, mask.shape[0])
+re = np.clip((rr + 1) * rsize + es, 0, mask.shape[0])
+cs = np.clip(cc * csize - es, 0, None)
+ce = np.clip((cc + 1) * csize + es, None, mask.shape[1])
+
+
+## %%time
+block_results_int = joblib.Parallel(
+    verbose=1, backend="loky", n_jobs=6, return_as="list"
+)(
+    joblib.delayed(wrap_int)(rrs, rre, ccs, cce)
+    for rrs, rre, ccs, cce in zip(*np.array([rs, re, cs, ce]).reshape(4, -1))
+)
+
+df_block_int = (
+    pd.concat([pd.DataFrame(r) for r in block_results_int])
+    .sort_values(["label"])
+    .drop_duplicates(keep="last", subset="label")
+    .set_index("label")
+)
