@@ -10,7 +10,6 @@ import tifffile
 import tqdm
 import zarr
 
-
 _all_mask_props = [
     "label",
     "centroid",
@@ -42,6 +41,15 @@ def wrap_processes(slice_coords):
     return result
 
 
+def wrap_threads(slice_coords):
+    rrs, rre, ccs, cce = slice_coords
+    mm = zimg[rrs:rre, ccs:cce]
+    result = skimage.measure.regionprops_table(mm, properties=_all_mask_props)
+    result["offset_row"] = np.ones(len(result["label"]), dtype=int) * rrs
+    result["offset_col"] = np.ones(len(result["label"]), dtype=int) * ccs
+    return result
+
+
 def main():
     mask = zimg[:]
     start_time = int(time.perf_counter())
@@ -61,7 +69,19 @@ def main():
             )
         ]
     end_time = int(time.perf_counter())
-    print("elapsed", datetime.timedelta(seconds=end_time - start_time))
+    print("elapsed (process)", datetime.timedelta(seconds=end_time - start_time))
+
+    start_time = int(time.perf_counter())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        block_results_2 = [
+            rrr
+            for rrr in tqdm.tqdm(
+                executor.map(wrap_threads, np.array([rs, re, cs, ce]).reshape(4, -1).T),
+                total=nr * nc,
+            )
+        ]
+    end_time = int(time.perf_counter())
+    print("elapsed (thread)", datetime.timedelta(seconds=end_time - start_time))
 
     df_block = (
         pd.concat([pd.DataFrame(r) for r in block_results])
