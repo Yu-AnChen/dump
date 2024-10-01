@@ -26,7 +26,12 @@ def mask_to_binary(in_path, out_path):
     )
 
 
-def adjust_rgb_contrast(in_path, in_range, out_range="uint8", jpeg_compression=True):
+def adjust_rgb_contrast(
+    in_path: str,
+    in_range: tuple[float, float],
+    out_range: str = "uint8",
+    jpeg_compression: bool = True,
+):
     import skimage.exposure
 
     reader = palom.reader.OmePyramidReader(in_path)
@@ -203,3 +208,9 @@ def merge_rgb(input, output, num_threads=0):
                 compressionargs={"level": 90},
             )
         print()
+
+
+if __name__ == "__main__":
+    import typer
+
+    typer.run(adjust_rgb_contrast)
