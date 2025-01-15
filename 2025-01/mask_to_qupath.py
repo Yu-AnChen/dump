@@ -10,8 +10,7 @@ def labeled_mask_to_polygon(labeled_mask):
     # exteriors per label, the exterior coordinates will be -
     # 1. "on" the pixels of that label, the pixel value of the indicies is that
     #    label
-    # 2. "on the outside" of the pixels of that label, the pixel value of the is
-    #    be 0
+    # 2. "on the outside" of the pixels of that label, the pixel value is 0
     cols, rows = np.array([cc[0] for cc in exteriors]).T
     pixel_values = labeled_mask[rows, cols].squeeze()
     # only keeps exteriors 1 (see above comment)
