@@ -2,7 +2,8 @@ import cv2
 import numpy as np
 
 
-def labeled_mask_to_polygon(labeled_mask):
+def labeled_mask_to_polygon(labeled_mask, mode="in"):
+    assert mode in ["in", "on"]
     exteriors, _ = cv2.findContours(
         labeled_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
     )
@@ -23,11 +24,24 @@ def labeled_mask_to_polygon(labeled_mask):
     for coords, is_on in zip(exteriors, is_on_labels):
         if not is_on:
             continue
-        polygon = None
-        # can only form polygon with more than 2 points
-        if len(coords) > 2:
-            # make closed polygon
-            polygon = np.vstack([coords.squeeze(), coords.squeeze()[0]])
+        # cannot form polygon with less than 3 points
+        if len(coords) < 3:
+            contours[idx] = None
+            idx += 1
+            continue
+        polygon = np.vstack([coords.squeeze(), coords.squeeze()[0]])
+        if mode == "on":
+            import shapely
+
+            polygon = (
+                np.array(
+                    shapely.Polygon(polygon)
+                    .buffer(0.5, join_style="mitre")
+                    .exterior.coords
+                )
+                .round(2)
+                .astype("float32")
+            )
         contours[idx] = polygon
         idx += 1
 
