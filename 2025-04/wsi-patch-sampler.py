@@ -1,12 +1,29 @@
 import dask
 import dask.diagnostics
 import numpy as np
-import palom
+import skimage.transform
 import skimage.util
 from palom.cli.align_he import get_reader
 
 
-def digitize_img(img, n_bins, p0=0, p100=100):
+def digitize_img(
+    img: np.ndarray, n_bins: int, p0: float = 0, p100: float = 100
+) -> np.ndarray:
+    """
+    Digitizes a grayscale image into bins based on percentiles, optionally
+    excluding the lowest and highest intensity pixels based on p0 and p100
+    thresholds.
+
+    Args:
+        img: 2D NumPy array of image intensities.
+        n_bins: Number of bins to divide the data into.
+        p0: Lower percentile threshold (default 0).
+        p100: Upper percentile threshold (default 100).
+
+    Returns:
+        A 2D NumPy array with same shape as `img`, where values are bin indices
+        and NaN where the pixel was excluded.
+    """
     assert n_bins > 0
     mask = np.full(img.shape, True)
     if p0 > 0:
@@ -16,7 +33,8 @@ def digitize_img(img, n_bins, p0=0, p100=100):
     assert np.any(mask)
     valid_pxs = img[mask]
     bin_edges = np.percentile(valid_pxs, np.linspace(0, 100, n_bins + 1))
-    bin_edges[-1] += 1
+    bin_edges[-1] += 1  # ensure upper bound
+
     digit_pxs = np.digitize(valid_pxs, bins=bin_edges)
 
     out = np.full(mask.shape, np.nan)
@@ -25,42 +43,54 @@ def digitize_img(img, n_bins, p0=0, p100=100):
 
 
 class WsiPatchSampler:
-    # FIXME downsize_factor should be equal to crop_size
-    # FIXME should remove level arg and select that based on crop size
+    """
+    A utility class to sample representative patches from a Whole Slide Image
+    (WSI) using intensity histogram-based binning.
+
+    Args:
+        img_path: Path to the WSI file.
+        channel: Which channel to use (default 0).
+        n_bins: Number of histogram bins/classes (default 8).
+        patch_size: Size of each patch in pixels (default 1024).
+        n_patches: Number of patches to sample per class (default 8).
+    """
+
     def __init__(
         self,
-        img_path,
-        channel=0,
-        level=10,
-        downsize_factor=1024,
-        n_classes=8,
-        p0=20,
-        p100=100,
-        crop_size=1024,
-        n_patches=8,
-    ):
+        img_path: str,
+        channel: int = 0,
+        n_bins: int = 8,
+        patch_size: int = 1024,
+        n_patches: int = 8,
+    ) -> None:
         self.img_path = img_path
         self.channel = channel
-        self.level = level
-        self.downsize_factor = downsize_factor
-        self.n_classes = n_classes
-        self.p0 = p0
-        self.p100 = p100
-        self.crop_size = crop_size
+        self.n_bins = n_bins
+        self.patch_size = patch_size
         self.n_patches = n_patches
 
         # Load image reader
         self.reader = get_reader(self.img_path)(self.img_path)
 
-    def _sample_patch_coordinates(self, dimg):
+        level_downsamples = [
+            (kk, vv)
+            for kk, vv in self.reader.level_downsamples.items()
+            if vv <= self.patch_size
+        ]
+        if not level_downsamples:
+            raise ValueError("Patch size too small.")
+        self._level, self._downsample = sorted(
+            level_downsamples, key=lambda x: x[1], reverse=True
+        )[0]
+
+    def _sample_patch_coordinates(self, dimg: np.ndarray) -> np.ndarray:
+        """Sample patch coordinates from each class/bin."""
         sample_classes = np.unique(dimg[np.isfinite(dimg)])
-
-        n_classes = len(sample_classes)
-
-        coords = np.zeros((n_classes * self.n_patches, 2), dtype="int")
+        n_bins = len(sample_classes)
+        coords = np.zeros((n_bins * self.n_patches, 2), dtype="int")
         for idx, cc in enumerate(sample_classes):
             options_rc = np.array(np.where(dimg == cc)).T
-            options_rc *= self.downsize_factor
+            options_rc *= self.patch_size
 
             n_pad = self.n_patches - len(options_rc)
             if n_pad > 0:
@@ -70,27 +100,47 @@ class WsiPatchSampler:
             coords[idx * self.n_patches : (idx + 1) * self.n_patches] = options_rc[
                 : self.n_patches
             ]
-        return np.array(coords)
+        return coords
 
-    def _mask_non_full_crop(self, dimg):
+    def _mask_non_full_crop(self, dimg: np.ndarray) -> np.ndarray:
+        """Mask out patches that would fall outside the image boundary."""
         rc = np.array(np.where(np.isfinite(dimg))).T
-        ends = rc * self.downsize_factor + self.crop_size
+        ends = rc * self.patch_size + self.patch_size
         is_full_crop = np.all(ends < self.reader.pyramid[0].shape[1:], axis=1)
-
         rr, cc = rc[~is_full_crop].T
         dimg[rr, cc] = np.nan
         return dimg
 
-    def extract_patches(self, channel=0, montage=False):
-        """Extracts patches from the WSI based on histogram classification."""
-        img = get_thumbnail_channels(self.img_path, self.level)[self.channel]
-        dimg = digitize_img(img=img, n_bins=self.n_classes, p0=self.p0, p100=self.p100)
+    def extract_patches(
+        self, channel: int = 0, montage: bool = False, p0: float = 30, p100: float = 100
+    ) -> np.ndarray:
+        """
+        Extract representative patches based on intensity histogram binning.
+
+        Args:
+            channel: Channel index to extract (default 0).
+            montage: Whether to return a visual montage (default False).
+            p0: Lower percentile threshold for binning (default 30).
+            p100: Upper percentile threshold for binning (default 100).
+
+        Returns:
+            Array of image patches (n_bins * n_patchs, patch_size, patch_size)
+            or a single montage 2D image (if montage=True).
+        """
+        _img = np.array(self.reader.pyramid[self._level][self.channel])
+        img = skimage.transform.rescale(
+            _img,
+            self._downsample / self.patch_size,
+            anti_aliasing=True,
+            preserve_range=True,
+        )
+        dimg = digitize_img(img=img, n_bins=self.n_bins, p0=p0, p100=p100)
         dimg = self._mask_non_full_crop(dimg)
         coords = self._sample_patch_coordinates(dimg)
 
         tiles = [
             self.reader.pyramid[0][
-                channel, rr : rr + self.crop_size, cc : cc + self.crop_size
+                channel, rr : rr + self.patch_size, cc : cc + self.patch_size
             ]
             for rr, cc in coords
         ]
@@ -99,47 +149,16 @@ class WsiPatchSampler:
             tiles = dask.compute(*tiles)
 
         if montage:
-            return skimage.util.montage(
-                tiles, grid_shape=(len(tiles) / self.n_patches, self.n_patches)
-            )
-        return tiles
+            grid_shape = (len(tiles) // self.n_patches, self.n_patches)
+            return skimage.util.montage(tiles, grid_shape=grid_shape)
+
+        return np.asarray(tiles)
 
 
-def get_thumbnail_channels(img_path, thumbnail_level, _dfactor=None):
-    Reader = get_reader(img_path)
-    reader = Reader(img_path)
-
-    if _dfactor is None:
-        _prev, _next = (
-            np.repeat(np.sort(list(reader.level_downsamples.values())), 2)[1:-1]
-            .reshape(-1, 2)
-            .T
-        )
-        _dfactor = np.unique(np.round(_next / _prev).astype("int"))
-        assert len(_dfactor) == 1, (
-            f"cannot find a single downsize factor for\n\t{img_path}"
-            f"\n\tdetected level downsamples {reader.level_downsamples}"
-            f"\n\tspecify it using `_dfactor`"
-        )
-        _dfactor = _dfactor[0]
-
-    last_level = len(reader.pyramid) - 1
-    if thumbnail_level > last_level:
-        channels = reader.pyramid[last_level]
-        channels = np.array(
-            [
-                palom.img_util.cv2_downscale_local_mean(
-                    np.array(cc), factor=_dfactor ** (thumbnail_level - last_level)
-                )
-                for cc in channels
-            ]
-        )
-    else:
-        channels = reader.pyramid[thumbnail_level].compute()
-    return channels
-
-
-# Example Usage:
-# sampler = WsiPatchSampler("path/to/image.ome.tiff")
-# patches = sampler.extract_patches()
-# montage = sampler.create_montage(patches)
+# -------------------------------------------------------------------------
+# Example usage
+# -------------------------------------------------------------------------
+# sampler = WsiPatchSampler("path/to/image.ome.tif")
+# patches = sampler.extract_patches(montage=True)
+# plt.imshow(patches)
+# plt.show()
