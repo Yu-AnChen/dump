@@ -101,8 +101,10 @@ mode, processing multiple pairs sequentially from a provided CSV file.
 
 4. **Get the Script:**
 
-    Download the script file (e.g., `map-roi.py`) and place it in your desired
-    working directory or a location included in your system's PATH.
+    [Download the script
+    file](https://github.com/Yu-AnChen/dump/blob/main/2024-10/map-roi/map-roi.py)
+    (`map-roi.py`) and place it in your desired working directory or a location
+    included in your system's PATH.
 
 ## Usage
 
