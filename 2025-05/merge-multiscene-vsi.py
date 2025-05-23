@@ -1,3 +1,4 @@
+import json
 import pathlib
 import re
 
@@ -8,13 +9,34 @@ import tqdm
 import zarr
 
 
-def parse_scene_origins(metadata_string):
-    # Regex pattern
-    pattern = r'"tag":\s*2018,\s*"name":\s*"RWC frame origin",\s*"value":\s*"\(([^,]+),\s*([^)]+)\)"'
+def find_objects_with_name(json_text, name):
+    """
+    Finds and extracts JSON objects with a specified "name" property.
 
-    # Find matches
-    matches = re.findall(pattern, metadata_string)
-    matches = np.array([(float(xx), float(yy)) for xx, yy in matches])
+    Args:
+        json_text (str): The JSON content as a string.
+        name (str): The value of the "name" property to search for.
+
+    Returns:
+        list: A list of matching JSON objects as Python dictionaries.
+    """
+    # Regex pattern to match objects with the specified "name"
+    pattern = rf'{{[^{{]*?"name":\s*"{re.escape(name)}".*?}}'
+
+    # Find all matches
+    matches = re.findall(pattern, json_text)
+
+    # Convert matches to Python dictionaries
+    objects = [json.loads(match) for match in matches]
+
+    return objects
+
+
+def parse_scene_origins(metadata_string):
+    name = "RWC frame origin"
+    matches = find_objects_with_name(metadata_string, name)
+
+    matches = np.array([eval(mm["value"]) for mm in matches])
 
     _, idx, counts = np.unique(matches, return_counts=True, return_index=True, axis=0)
     mask = counts == 2
@@ -30,7 +52,7 @@ def merge_scenes(vsi_path, out_path):
         )
     out_path = pathlib.Path(out_path)
     out_path.parent.mkdir(exist_ok=True, parents=True)
-    assert not out_path.exists()
+    assert not out_path.exists(), f"{out_path} already exists"
 
     slide = reader.store._slide
     if slide.num_scenes == 1:
