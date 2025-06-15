@@ -4,11 +4,14 @@ import dask.array as da
 import dask.diagnostics
 import numpy as np
 import palom
+import pandas as pd
 import scipy.ndimage
+import skimage.exposure
 import skimage.filters
 import skimage.morphology
 import skimage.restoration
 import skimage.util
+import tqdm.contrib
 import zarr
 
 # Pre-calculate the Laplacian operator kernel. We'll always be using 2D images.
@@ -35,7 +38,13 @@ def local_maxima_peak(img, sigma):
     return out
 
 
-def process(img_path, puncta_channels, dna_channel, puncta_sigma):
+def process(
+    img_path,
+    puncta_channels,
+    dna_channel,
+    puncta_sigma,
+    save_RAM=False,
+):
     reader = palom.reader.OmePyramidReader(img_path)
     path = reader.path
 
@@ -45,14 +54,18 @@ def process(img_path, puncta_channels, dna_channel, puncta_sigma):
         img_dna = reader.pyramid[0][dna_channel]
 
     imgs = reader.pyramid[0][puncta_channels]
-    imgs_peak_zarr_stores = [
-        zarr.TempStore(dir=path.parent, prefix=f"{ii:02}-zarr-")
-        for ii in range(len(imgs))
-    ]
+
+    imgs_log_peak_zarr_stores = [zarr.MemoryStore() for ii in range(len(imgs))]
+    if save_RAM:
+        imgs_log_peak_zarr_stores = [
+            zarr.TempStore(dir=path.parent, prefix=f"log-{ii:02}-zarr-")
+            for ii in range(len(imgs))
+        ]
     masks_peak = zarr.zeros(imgs.shape, chunks=imgs.chunksize, dtype="bool")
 
-    for ii, (img, zstore) in enumerate(zip(imgs, imgs_peak_zarr_stores)):
-        img_peak = img.map_overlap(
+    puncta_dfs = []
+    for ii, (img, lzstore) in enumerate(zip(imgs, imgs_log_peak_zarr_stores)):
+        img_log_peak = img.map_overlap(
             local_maxima_peak,
             sigma=puncta_sigma,
             depth=32,
@@ -61,19 +74,38 @@ def process(img_path, puncta_channels, dna_channel, puncta_sigma):
         )
 
         with dask.diagnostics.ProgressBar():
-            palom.pyramid.da_to_zarr(img_peak, zarr_store=zstore)
+            palom.pyramid.da_to_zarr(img_log_peak, zarr_store=lzstore)
 
-        coords = np.nonzero(zarr.Array(zstore))
-        values = zarr.Array(zstore)[coords]
+        coords = np.nonzero(zarr.Array(lzstore))
+        values = zarr.Array(lzstore)[coords]
 
-        threshold = skimage.filters.threshold_otsu(values)
-        peaks = values > threshold
+        threshold = skimage.filters.threshold_triangle(values)
+        valid_peaks = values > threshold
 
-        masks_peak.vindex[ii, coords[0][peaks], coords[1][peaks]] = True
+        masks_peak.vindex[ii, coords[0][valid_peaks], coords[1][valid_peaks]] = True
+
+        # -------------- save intensity properties for further filtering ------------- #
+        df = pd.DataFrame()
+        df[["Y", "X"]] = np.asarray(coords).T[valid_peaks].astype("int32")
+        df["_LoG_intensity"] = zarr.Array(lzstore)[
+            coords[0][valid_peaks], coords[1][valid_peaks]
+        ]
+        df["channel_intensity"] = img[
+            da.from_zarr(masks_peak, name=False)[ii]
+        ].compute()
+        df["LoG_intensity"] = (
+            skimage.exposure.rescale_intensity(
+                df["_LoG_intensity"].values, out_range=str(img.dtype)
+            )
+            .round()
+            .astype(img.dtype)
+        )
+        puncta_dfs.append(df)
 
     # ------------------------- write puncta mask to disk ------------------------ #
     stem = re.sub(r"\.ome\.tiff?$", "", path.name)
-    channel_str = "_".join([str(cc) for cc in puncta_channels])
+    max_digit_len = max([len(str(cc)) for cc in puncta_channels])
+    channel_str = "_".join([f"{cc:0{max_digit_len}}" for cc in puncta_channels])
     out_path_mask = path.parent / f"{stem}-spots-channel_{channel_str}.ome.tif"
 
     palom.pyramid.write_pyramid(
@@ -87,6 +119,19 @@ def process(img_path, puncta_channels, dna_channel, puncta_sigma):
         compression="zlib",
         is_mask=True,
     )
+
+    for cc, dd in tqdm.contrib.tzip(
+        puncta_channels, puncta_dfs, desc="Writing measurements"
+    ):
+        out_df_name = re.sub(
+            r"\.ome\.tiff?$",
+            f"-measurements_{cc:0{max_digit_len}}.parquet",
+            out_path_mask.name,
+        )
+        out_df_path = path.parent / out_df_name
+        out_df_path.parent.mkdir(exist_ok=True, parents=True)
+
+        dd.to_parquet(out_df_path, engine="pyarrow")
 
     # ------------------------------ write qc image ------------------------------ #
     out_qc_name = re.sub(r"\.ome\.tiff?$", "-qc.ome.tif", out_path_mask.name)
@@ -103,20 +148,14 @@ def process(img_path, puncta_channels, dna_channel, puncta_sigma):
     mosaics_qc.append(imgs)
     channel_names_qc.append([f"{cc}" for cc in puncta_channels])
 
-    # mosaics_qc.extend(
-    #     [da.from_zarr(ss, name=False) for ss in imgs_peak_zarr_stores]
-    # )
-    mosaics_qc.extend(
-        [
-            mm.map_overlap(
-                skimage.morphology.binary_dilation,
-                footprint=skimage.morphology.disk(1),
-                depth=4,
-                boundary=False,
-            )
-            for mm in da.from_zarr(masks_peak, name=False)
-        ]
-    )
+    for mm in da.from_zarr(masks_peak, name=False):
+        mask_dilated = mm.map_overlap(
+            skimage.morphology.binary_dilation,
+            footprint=skimage.morphology.disk(1),
+            depth=4,
+            boundary=False,
+        )
+        mosaics_qc.append(mask_dilated)
     channel_names_qc.extend([f"{cc}_puncta" for cc in puncta_channels])
 
     palom.pyramid.write_pyramid(
@@ -132,9 +171,18 @@ def process(img_path, puncta_channels, dna_channel, puncta_sigma):
     )
 
 
-"""
+img_paths = r"""
+W:\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\DNA-FISH-test1\Orion_FISH_test1\Tanjina_ORION_FISH_test_HGSOC\LSP14728\registration\LSP14728_001_A107_P54N_HMS_TK.ome.tif
+W:\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\DNA-FISH-test1\Orion_FISH_test1\Tanjina_ORION_FISH_test_HGSOC\LSP31047\registration\LSP31047_P110_A107_P54N_HMS_TK.ome.tif
+W:\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\DNA-FISH-test1\Orion_FISH_test1\Tanjina_ORION_FISH_test_HGSOC\LSP31050\registration\LSP31050_P110_A107_P54N_HMS_TK.ome.tif
+""".strip().split("\n")
+
 img_path = r"W:\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\DNA-FISH-test1\Orion_FISH_test1\Tanjina_ORION_FISH_test_HGSOC\LSP31050\registration\LSP31050_P110_A107_P54N_HMS_TK.ome.tif"
 puncta_channels = [22, 24, 27, 28, 29]
-dna_channel = 20
-puncta_sigma = 2
-"""
+# puncta_channels = [27, 28]
+dna_channel = 0
+puncta_sigma = 1.2
+
+
+for pp in img_paths:
+    process(pp, puncta_channels, dna_channel, puncta_sigma)
