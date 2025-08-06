@@ -101,7 +101,7 @@ def segment_slide(
     _img = reader.pyramid[channel][0]
 
     with dask.diagnostics.ProgressBar():
-        p0, p1 = np.percentile(_img.flatten(), [intensity_p0, intensity_p1]).compute()
+        p0, p1 = np.percentile(_img.compute(), [intensity_p0, intensity_p1])
     in_range = (p0, p1)
     print("intensity range:", np.round(in_range, decimals=2))
 
@@ -239,7 +239,7 @@ def make_qc_image(
         skimage.util.img_as_ubyte, dtype="uint8"
     )
     with dask.diagnostics.ProgressBar():
-        p0, p1 = np.percentile(img.flatten(), [intensity_p0, intensity_p1]).compute()
+        p0, p1 = np.percentile(img.compute(), [intensity_p0, intensity_p1])
 
     img = img.map_blocks(
         lambda x: skimage.exposure.rescale_intensity(
@@ -296,17 +296,26 @@ def difference_mask_from_file(path_1, path_2, out_dir):
     return
 
 
-slide_ids = ["LSP33233", "LSP33248"]
+slide_ids = """
+LSP33234
+LSP33249
+LSP33849
+LSP33850
+LSP33851
+LSP33869
+LSP33870
+LSP33871
+""".strip().split("\n")
 
 for ii in slide_ids:
     print(f"\nProcessing slide {ii} ...")
     img_path = pathlib.Path(
-        rf"W:\cycif-production\134-Liposarcoma\P134_exp5_CYCIF_AbTest_A51\McMicro\P134_exp5_CYCIF_AbTest_A51\data\{ii}\registration\{ii}.ome.tif"
+        rf"W:\cycif-production\134-Liposarcoma\P134_exp6_CYCIF_AbTest_A51\McMicro\registration images\{ii}.ome.tif"
     )
     out_dir = pathlib.Path(
-        # rf"W:\cycif-production\134-Liposarcoma\P134_exp5_CYCIF_AbTest_A51\YC-mcmicro\{ii}\segmentation\cellpose"
-        r"W:\cycif-production\134-Liposarcoma\P134_exp5_CYCIF_AbTest_A51\YC-mcmicro\dev"
+        rf"W:\cycif-production\134-Liposarcoma\P134_exp6_CYCIF_AbTest_A51\McMicro\segmentation\{ii}\segmentation\cellpose"
     )
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     mask_path = segment_slide(
         img_path,
