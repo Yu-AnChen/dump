@@ -1,13 +1,14 @@
 import argparse
-import numpy as np
-import matplotlib
+
+import matplotlib.cm
 import matplotlib.pyplot as plt
 import napari
 import napari.utils
+import numpy as np
+import palom
 import pandas as pd
 import scipy.ndimage as ndi
 import skimage.morphology
-import palom
 import tqdm
 
 
@@ -45,12 +46,12 @@ def map_mask_labels(mask_pyramid, df_mapper):
     for kk in tqdm.tqdm(df_mapper.columns):
         idxr = mapping_indexer(df_mapper[[kk]], column_name=kk)
         mapped_masks[kk] = [
-            mask_to_contour(ll).astype(mask_pyramid[0].dtype)
-            if hasattr(ll, "map_blocks")
-            else mask_to_contour(ll)
+            ll.map_blocks(mask_to_contour, dtype=mask_pyramid[0].dtype).map_blocks(
+                recolor, indexer=idxr, dtype="float16"
+            )
             for ll in mask_pyramid
         ]
-        mapped_masks[kk] = [recolor(ll, idxr) for ll in mapped_masks[kk]]
+
     return mapped_masks
 
 
