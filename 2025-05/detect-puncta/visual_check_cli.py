@@ -139,6 +139,7 @@ def main():
     )
     plt.gca().set(xticks=[], yticks=range(12), yticklabels=list(range(11)) + ["11+"])
     plt.title("Colormap for counts")
+    plt.show()
 
     napari.run()
 
