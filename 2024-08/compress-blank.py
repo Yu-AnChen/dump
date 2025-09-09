@@ -1,4 +1,6 @@
+import datetime
 import pathlib
+import pprint
 import re
 import time
 
@@ -7,11 +9,11 @@ import ome_types
 import palom
 import skimage.exposure
 import skimage.filters
-import skimage.filters.thresholding
 import skimage.morphology
 import skimage.segmentation
 import tifffile
 import zarr
+from loguru import logger
 
 PYRAMID_DEFAULTS = dict(
     downscale_factor=2,
@@ -39,17 +41,18 @@ def src_tif_tags(img_path):
 def get_img_path(img_path):
     img_path = pathlib.Path(img_path)
     assert img_path.exists
-    assert re.search(r"(?i).ome.tiff?$", img_path.name) is not None
+    assert re.search(r"(?i).ome.tiff?$", img_path.name) is not None, img_path
     return img_path
 
 
 def get_output_path(output_path, img_path):
-    img_name = re.sub(r"(?i).ome.tiff?$", ".ome.tif", img_path.name)
+    img_name = re.sub(r"(?i).ome.tiff?$", "", img_path.name)
+    out_name = f"{img_name}-bg_compressed.ome.tif"
     if output_path is None:
-        output_path = img_path.parent / re.sub(
-            r".ome.tif$", "-tissue.ome.tif", img_name
-        )
+        output_path = img_path.parent / out_name
     output_path = pathlib.Path(output_path)
+    if output_path.is_dir():
+        output_path = output_path / out_name
     assert output_path != img_path
     assert re.search(r"(?i).ome.tiff?$", output_path.name) is not None
     output_path.parent.mkdir(exist_ok=True, parents=True)
@@ -84,16 +87,21 @@ def make_tissue_mask(
     if LEVEL > len(reader.pyramid) - 1:
         LEVEL = len(reader.pyramid) - 1
     _thumbnail = reader.pyramid[LEVEL][:]
-    thumbnail = np.array(
-        [
-            palom.img_util.cv2_downscale_local_mean(
-                cc, img_pyramid_downscale_factor ** (thumbnail_level - LEVEL)
-            )
-            for cc in _thumbnail
-        ]
-    )
-    thumbnail = np.log1p(thumbnail.sum(axis=0))
+    d_factor = img_pyramid_downscale_factor ** (thumbnail_level - LEVEL)
+    thumbnail = np.array(_thumbnail[:, ::d_factor, ::d_factor])
+    # thumbnail = np.array(
+    #     [
+    #         palom.img_util.cv2_downscale_local_mean(
+    #             cc, img_pyramid_downscale_factor ** (thumbnail_level - LEVEL)
+    #         )
+    #         for cc in _thumbnail
+    #     ]
+    # )
+
+    # thumbnail = np.log1p(thumbnail.sum(axis=0))
+    thumbnail = np.log1p(thumbnail.max(axis=0))
     entropy_thumbnail = local_entropy(thumbnail)
+    # return thumbnail, entropy_thumbnail
 
     erange = np.ptp(entropy_thumbnail)
     _threshold = skimage.filters.threshold_otsu(entropy_thumbnail)
@@ -107,7 +115,7 @@ def make_tissue_mask(
 
     # forcing threshold to be within 10th and 90th percent of the range
     _threshold += level_center * erange
-    print(_threshold)
+    # print(_threshold)
 
     thresholds = np.concatenate(
         [
@@ -116,7 +124,9 @@ def make_tissue_mask(
         ]
     )
     level_adjusts = np.arange(-2, 3, 1)
-    masks = entropy_img_to_masks(entropy_thumbnail, thresholds, dilation_radius)
+    masks = entropy_img_to_masks(
+        thumbnail, entropy_thumbnail, thresholds, dilation_radius
+    )
     mask = masks[list(level_adjusts).index(level_adjust)]
 
     if plot:
@@ -132,11 +142,15 @@ def make_tissue_mask(
     return mask
 
 
-def entropy_img_to_masks(entropy_img, thresholds, dilation_radius):
+def entropy_img_to_masks(
+    img, entropy_img, thresholds, dilation_radius, img_is_dark_backgroud=True
+):
+    if not img_is_dark_backgroud:
+        img = -1.0 * img
     masks = np.full((len(thresholds), *entropy_img.shape), fill_value=False, dtype=bool)
     for idx, tt in enumerate(thresholds):
         masks[idx] = skimage.morphology.binary_dilation(
-            entropy_img > tt,
+            (entropy_img > tt) | (img >= np.percentile(img[entropy_img > tt], 25)),
             footprint=skimage.morphology.disk(radius=dilation_radius),
         )
     return masks
@@ -246,14 +260,14 @@ def write_masked(img_path, output_path, tissue_mask, mask_upscale_factor):
     mask_full_zarr[:h, :w] = mask_full[:h, :w]
     mask_full = None
 
-    mosaic = reader.pyramid[0] * mask_full_zarr
+    mosaic = (reader.pyramid[0] * mask_full_zarr).astype(reader.pixel_dtype)
 
     try:
         tif_tags = src_tif_tags(img_path)
     except Exception:
         tif_tags = {}
 
-    software = "detect_tissue_v0"
+    software = "compress_bg_v0"
     tif_tags["software"] = f"{tif_tags.get('software', None)}-{software}"
 
     palom.pyramid.write_pyramid(
@@ -276,40 +290,119 @@ def write_masked(img_path, output_path, tissue_mask, mask_upscale_factor):
 
 
 def process_file(
-    img_path,
-    thumbnail_level=6,
-    img_pyramid_downscale_factor=2,
-    dilation_radius=2,
-    output_path=None,
+    img_path: str,
+    output_path: str = None,
+    only_preview: bool = True,
+    thumbnail_level: int = 6,
+    img_pyramid_downscale_factor: int = 2,
+    dilation_radius: int = 2,
+    level_center: float = -0.2,
+    level_adjust: int = 0,
 ):
+    _args = locals()
+    del _args["img_path"]
+
+    import matplotlib.pyplot as plt
+
     img_path = get_img_path(img_path)
     output_path = get_output_path(output_path, img_path)
 
-    # tissue_mask = make_tissue_mask(img_path, thumbnail_factor, dilation_radius)
+    log_path = output_path.parent / "compress-bg-log" / f"{output_path.name}.log"
+    log_path.parent.mkdir(exist_ok=True, parents=True)
+
+    logger.remove()
+    logger.add(sys.stderr)
+    logger.add(log_path, rotation="5 MB")
+    logger.info(f"Start processing {img_path.name}")
+    logger.info(
+        f"\nFunction args\n{pprint.pformat(_args, indent=4, sort_dicts=False, width=600)}\n"
+    )
+
+    start_time = int(time.perf_counter())
+
     tissue_mask = make_tissue_mask(
-        img_path, thumbnail_level, img_pyramid_downscale_factor, dilation_radius
-    )
-    write_masked(
         img_path,
-        output_path,
-        tissue_mask,
-        img_pyramid_downscale_factor**thumbnail_level,
+        thumbnail_level,
+        img_pyramid_downscale_factor,
+        dilation_radius,
+        plot=True,
+        level_center=level_center,
+        level_adjust=level_adjust,
+    )
+    # skip masking when tissue area > 90%
+    if tissue_mask.sum() / tissue_mask.size > 0.9:
+        tissue_mask[:] = True
+
+    fig = plt.gcf()
+    fig.set_size_inches(fig.get_size_inches() * 1.5)
+    fig.savefig(
+        output_path.parent / re.sub(r"(?i).ome.tiff?$", ".jpg", output_path.name),
+        bbox_inches="tight",
+        dpi=144,
+    )
+    plt.close(fig)
+
+    if not only_preview:
+        write_masked(
+            img_path,
+            output_path,
+            tissue_mask,
+            img_pyramid_downscale_factor**thumbnail_level,
+        )
+
+    end_time = int(time.perf_counter())
+    logger.info(
+        f"Done processing (elapsed {datetime.timedelta(seconds=end_time - start_time)}) {img_path.name}\n"
     )
 
 
-test_images = sorted(
-    pathlib.Path(
-        r"/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/20240714-deform-registration-crc/img-data"
-    ).glob("*-ori.tif")
-)
-"""
-in_dir = r"X:\cycif-production\184-CRC_polyps\Orion_pilot-20240507"
-files = sorted(pathlib.Path(in_dir).glob("*.ome.tiff"))[3:]
+def run_batch(csv_path, print_args=True, dryrun=False, **kwargs):
+    import csv
+    import inspect
+    import pprint
+    import types
 
-process_file(
-    r"X:\cycif-production\184-CRC_polyps\Orion_pilot-20240507\LSP23366_001_P54_HMS_Artemis4_correct_001080.ome.tiff",
-    64,
-    2,
-    r"X:\cycif-production\184-CRC_polyps\Orion_pilot-20240507\LSP23366_001_P54_HMS_Artemis4_correct_001080-test-ori.ome.tiff",
-)
-"""
+    from fire.parser import DefaultParseValue
+
+    func = process_file
+
+    if print_args:
+        _args = [str(vv) for vv in inspect.signature(func).parameters.values()]
+        print(f"\nFunction args\n{pprint.pformat(_args, indent=4)}\n")
+    _arg_types = inspect.get_annotations(func)
+    arg_types = {}
+    for k, v in _arg_types.items():
+        if isinstance(v, types.UnionType):
+            v = v.__args__[0]
+        arg_types[k] = v
+
+    with open(csv_path) as f:
+        csv_kwargs = [
+            {
+                kk: arg_types[kk](DefaultParseValue(vv))
+                for kk, vv in rr.items()
+                if (kk in arg_types) & (vv is not None)
+            }
+            for rr in csv.DictReader(f)
+        ]
+
+    if dryrun:
+        for kk in csv_kwargs:
+            pprint.pprint({**kwargs, **kk}, sort_dicts=False)
+            print()
+        return
+
+    for kk in csv_kwargs:
+        func(**{**kwargs, **kk})
+
+
+def main():
+    import fire
+
+    fire.Fire({"run": process_file, "run-batch": run_batch})
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
