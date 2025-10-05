@@ -21,15 +21,15 @@ First, place the environment files in a memorable location on your computer.
 Your user home directory is a great choice.
 
 1. Open **File Explorer** and navigate to your user folder (e.g.,
-   C:\Users\<your-username>).
-2. Copy the palomero-env.zip file into this directory.
-3. Right-click on palomero-env.zip and select **"Extract All..."**.
-4. Ensure the final folder path is ...\palomero-env, not
-   ...\palomero-env\palomero-env. Some unzip tools create a nested folder; if
+   `C:\Users\<your-username>`).
+2. Copy the **palomero-env.zip** file into this directory.
+3. Right-click on **palomero-env.zip** and select **"Extract All..."**.
+4. Ensure the final folder path is `...\palomero-env`, not
+   `...\palomero-env\palomero-env`. Some unzip tools create a nested folder; if
    this happens, move the contents up one level.
 
-Inside this directory, you will find the Pixi executable (pixi.exe) and the
-project's lock file (pixi.lock), which precisely defines the software
+Inside this directory, you will find the Pixi executable (**pixi.exe**) and the
+project's lock file (**pixi.lock**), which precisely defines the software
 environment.
 
 ## Step 2: Open a Command Prompt
@@ -37,7 +37,7 @@ environment.
 All commands must be run from within the palomero-env directory. The easiest way
 to do this is:
 
-1. In File Explorer, navigate into the palomero-env folder.
+1. In File Explorer, navigate into the `palomero-env` folder.
 2. Click in the address bar at the top of the window.
 3. Type **cmd** and press **Enter**.
 
@@ -45,8 +45,8 @@ This will open a new Command Prompt window with the correct path already set.
 
 ## Step 3: Install Dependencies
 
-Now, you will install the environment. This command reads the pixi.lock file and
-downloads all the necessary packages.
+Now, you will install the environment. This command reads the **pixi.lock** file
+and downloads all the necessary packages.
 
 In the Command Prompt window, run the following command:
 
@@ -79,7 +79,7 @@ pixi.exe run palomero-web
 ```
 
 The server will start, and you will see output in your terminal indicating that
-it is Running on <http://localhost:5001>.
+it is running on **<http://localhost:5001>**.
 
 **Important:** Do not close this Command Prompt window. Closing it will shut
 down the server.
@@ -119,7 +119,7 @@ Uninstalling Palomero is simple and does not require any special tools.
 * **'pixi.exe' is not recognized... error:** This error means your Command
   Prompt is not in the correct directory. Close the Command Prompt and repeat
   **Step 2** carefully.
-* **Login Failed:** Double-check that you replaced `<your-ecommons\>` with your
+* **Login Failed:** Double-check that you replaced `<your-ecommons>` with your
   correct ID and that you typed your password correctly.
 * **"Address already in use" error:** This means another application is using
   port 5001. You can choose a different port, for example:
