@@ -1,6 +1,6 @@
 import argparse
+import sys
 
-import matplotlib.cm
 import matplotlib.pyplot as plt
 import napari
 import napari.utils
@@ -51,11 +51,16 @@ def map_mask_labels(mask_pyramid, df_mapper):
             )
             for ll in mask_pyramid
         ]
+        mapped_masks[f"{kk}-m"] = [
+            ll.map_blocks(recolor, indexer=idxr, dtype="float16") for ll in mask_pyramid
+        ]
 
     return mapped_masks
 
 
 def main():
+    from qtpy.QtWidgets import QApplication
+
     parser = argparse.ArgumentParser(
         description="Visual QC for puncta detection: overlay spot counts per cell."
     )
@@ -80,11 +85,18 @@ def main():
         required=True,
         help="Comma separated list of all channel names in the image",
     )
+    parser.add_argument(
+        "--colormap",
+        type=str,
+        default="tab10",
+        help="Name of the colormap for count-per-cell rendering",
+    )
     args = parser.parse_args()
 
     reader = palom.reader.OmePyramidReader(args.img_path)
     mask_reader = palom.reader.OmePyramidReader(args.mask_path)
     counts = pd.read_parquet(args.counts_path, engine="pyarrow")
+    mpl_cmap = plt.get_cmap(args.colormap)
 
     channel_names = args.channel_names.split(",")
     if len(channel_names) != len(reader.pyramid[0]):
@@ -94,6 +106,9 @@ def main():
         channel_names = None
 
     v = napari.Viewer()
+    app = QApplication.instance()
+    app.lastWindowClosed.connect(lambda: sys.exit(0))
+
     v.scale_bar.visible = True
     v.scale_bar.unit = "µm"
     scale = (reader.pixel_size, reader.pixel_size)
@@ -106,8 +121,9 @@ def main():
         scale=scale,
     )
 
+    colors = mpl_cmap(np.linspace(0, 1, 10))
     cmap = napari.utils.Colormap(
-        colors=((0.1, 0.1, 0.1),) + matplotlib.cm.tab10.colors,
+        colors=((0.1, 0.1, 0.1, 1),) + tuple(colors),
         high_color=(1, 1, 1, 1),
         # BUG nan_color does not seem to work as of napari v0.6.1
         nan_color=np.zeros(4),
@@ -134,11 +150,12 @@ def main():
     plt.figure()
     plt.imshow(
         np.reshape(
-            np.vstack([[0, 0, 0, 1], matplotlib.cm.tab10(np.arange(10)), [1, 1, 1, 1]]),
+            np.vstack([[0.1, 0.1, 0.1, 1], colors, [1, 1, 1, 1]]),
             (-1, 1, 4),
         )
     )
     plt.gca().set(xticks=[], yticks=range(12), yticklabels=list(range(11)) + ["11+"])
+    plt.gca().invert_yaxis()
     plt.title("Colormap for counts")
     plt.show()
 
@@ -151,8 +168,11 @@ if __name__ == "__main__":
 
 """
 python \\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\scripts-fish-v2025-11\04-viz-for-parquet.py
-  --img-path "\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP19422\fish-spotiflow\qc\LSP19422-spots-channel_22_23_24_27-qc.ome.tif"
-  --mask-path "\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP19422\segmentation\LSP19422-cellpose-nucleus.ome.tif"
-  --counts-path "\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP19422\fish-spotiflow\counts\cellpose-nucleus.parquet"
+  --img-path "\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18304\fish-spotiflow\qc\LSP18304-spots-channel_22_23_24_27-qc.ome.tif"
+  --mask-path "\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18304\segmentation\LSP18304-cellpose-nucleus.ome.tif"
+  --counts-path "\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18304\fish-spotiflow\counts\cellpose-nucleus.parquet"
   --channel-names "DNA,CEP8,CCNE1,MYC,CEP19,CEP8_peak,CCNE1_peak,MYC_peak,CEP19_peak"
+
+
+python "/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/20250520-Tanjina-puncta-detection/tanjina-fish-presentation/viz.py" --img-path "/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/20250520-Tanjina-puncta-detection/tanjina-fish-presentation/LSP18304-spots-channel_22_23_24_27-qc.ome.tif" --mask-path "/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/20250520-Tanjina-puncta-detection/tanjina-fish-presentation/LSP18304-cellpose-nucleus.ome.tif" --counts-path "/Users/yuanchen/HMS Dropbox/Yu-An Chen/000 local remote sharing/20250520-Tanjina-puncta-detection/tanjina-fish-presentation/counts/cellpose-nucleus.parquet" --channel-names "DNA,CEP8,CCNE1,MYC,CEP19,CEP8_peak,CCNE1_peak,MYC_peak,CEP19_peak"
 """

@@ -46,10 +46,12 @@ def process(
         # -------------- save intensity properties for further filtering ------------- #
         df = pd.DataFrame()
         df[["Y", "X"]] = coords.astype("int32")
+        df["prob_spotiflow"] = details.prob.astype("float32")
+        # NOTE: the coordinates from spotiflow are not sorted
+        df.sort_values(["Y", "X"], inplace=True)
         df["channel_intensity"] = img[
             da.from_zarr(masks_peak, name=False)[ii]
         ].compute()
-        df["prob_spotiflow"] = details.prob.astype("float32")
 
         puncta_dfs.append(df)
 
@@ -123,21 +125,20 @@ def process(
 
 
 img_paths = r"""
-\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18304\registration\LSP18304.ome.tif
-\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18316\registration\LSP18316.ome.tif
-\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP19422\registration\LSP19422.ome.tif
+\\research.files.med.harvard.edu\hits\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION_FISH_FT_p53_Tanjina_81925\FT_iSTIC\LSP18303\registration\LSP18303.ome.tif
+\\research.files.med.harvard.edu\hits\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION_FISH_FT_p53_Tanjina_81925\FT_iSTIC\LSP18315\registration\LSP18315.ome.tif
 """.strip().split("\n")
 
 out_dirs = r"""
-\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18304\fish-spotiflow
-\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP18316\fish-spotiflow
-\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION-FISH-72525_Tanjina\October2025-Batch2\LSP19422\fish-spotiflow
+\\research.files.med.harvard.edu\hits\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION_FISH_FT_p53_Tanjina_81925\FT_iSTIC\LSP18303\fish-spotiflow
+\\research.files.med.harvard.edu\hits\lsp-analysis\cycif-production\110-BRCA-Mutant-Ovarian-Precursors\ORION_FISH_FT_p53_Tanjina_81925\FT_iSTIC\LSP18315\fish-spotiflow
 """.strip().split("\n")
 
-puncta_channels = [22, 23, 24, 27]
+
+puncta_channels = [22, 24]
 dna_channel = 20
 puncta_sigma = None
 
 
-for pp, oo in zip(img_paths[1:], out_dirs[1:]):
+for pp, oo in zip(img_paths[:], out_dirs[:]):
     process(pp, oo, puncta_channels, dna_channel, puncta_sigma, model_name="hybiss")
