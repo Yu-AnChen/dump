@@ -2,7 +2,9 @@
 #                              Process large image                             #
 # ---------------------------------------------------------------------------- #
 import datetime
+import inspect
 import pathlib
+import re
 import time
 
 import cellpose.denoise
@@ -24,18 +26,28 @@ dn_model = cellpose.denoise.CellposeDenoiseModel(
 )
 
 
-def segment_tile(timg, diameter, flow_threshold):
+def segment_tile(timg, diameter, flow_threshold, **kwargs):
+    # Get valid argument names for dn_model.eval
+    valid_args = inspect.signature(dn_model.eval).parameters.keys()
+    # Build the argument dict for eval
+    eval_kwargs = {
+        "x": timg,
+        "diameter": diameter,
+        "flow_threshold": flow_threshold,
+        "channels": [0, 0],
+        "normalize": False,
+    }
+    # Add only valid kwargs
+    for k, v in kwargs.items():
+        if k in valid_args:
+            eval_kwargs[k] = v
+        else:
+            print(
+                f"Warning: '{k}' is not a valid argument for model.eval and will be ignored."
+            )
+
     with torch.no_grad():
-        tmask = dn_model.eval(
-            timg,
-            diameter=diameter,
-            channels=[0, 0],
-            # inputs are globally normalized already
-            normalize=False,
-            flow_threshold=flow_threshold,
-            # GPU with 8 GB of RAM can handle 1024x1024 images
-            # tile=True,
-        )[0]
+        tmask = dn_model.eval(**eval_kwargs)[0]
 
     if np.all(tmask == 0):
         return tmask.astype("bool")
@@ -79,6 +91,7 @@ def segment_slide(
     intensity_gamma=1.0,
     diameter=15.0,
     flow_threshold=0.4,
+    **kwargs,
 ):
     """
     Process a slide image with Cellpose denoising and segmentation.
@@ -98,10 +111,11 @@ def segment_slide(
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    _img = reader.pyramid[channel][0]
+    _img = reader.pyramid[0][channel]
 
     with dask.diagnostics.ProgressBar():
-        p0, p1 = np.percentile(_img.compute(), [intensity_p0, intensity_p1])
+        ss = np.ceil(np.prod(_img.shape) / (10_000**2)).astype("int")
+        p0, p1 = np.percentile(_img[::ss, ::ss].compute(), [intensity_p0, intensity_p1])
     in_range = (p0, p1)
     print("intensity range:", np.round(in_range, decimals=2))
 
@@ -125,16 +139,31 @@ def segment_slide(
         dtype=bool,
         diameter=diameter,
         flow_threshold=flow_threshold,
+        **kwargs,
     )
     print("run cellpose; number of chunks:", _binary_mask.numblocks)
 
     _binary_mask = da_to_zarr(_binary_mask, num_workers=2)
     binary_mask = da.from_zarr(_binary_mask, name=False)
 
+    out_path_binary = (
+        out_dir / f"_{reader.path.name.split('.')[0]}-cellpose-nucleus-binary.ome.tif"
+    )
+    palom.pyramid.write_pyramid(
+        [binary_mask.astype("uint8")],
+        out_path_binary,
+        pixel_size=reader.pixel_size,
+        downscale_factor=2,
+        tile_size=1024,
+        compression="zlib",
+        save_RAM=True,
+        is_mask=True,
+    )
+
     end = int(time.perf_counter())
     print("\nelapsed (cellpose):", datetime.timedelta(seconds=end - start))
 
-    _labeled_mask = dask_image.ndmeasure.label(binary_mask)[0]
+    _labeled_mask = dask_image.ndmeasure.label(binary_mask.rechunk(4096))[0]
     labeled_mask = da_to_zarr(_labeled_mask)
 
     end_label = int(time.perf_counter())
@@ -232,7 +261,7 @@ def make_qc_image(
     reader_mask = palom.reader.OmePyramidReader(mask_path)
     out_path = out_dir / f"{reader.path.name.split('.')[0]}-cellpose-qc.ome.tif"
 
-    img = reader.pyramid[channel][0]
+    img = reader.pyramid[0][channel]
     mask = reader_mask.pyramid[0][0]
 
     outline = mask.map_blocks(mask_to_contour, dtype="bool").map_blocks(
@@ -296,25 +325,24 @@ def difference_mask_from_file(path_1, path_2, out_dir):
     return
 
 
-slide_ids = """
-LSP33234
-LSP33249
-LSP33849
-LSP33850
-LSP33851
-LSP33869
-LSP33870
-LSP33871
+config = r"""
+LSP32265,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro/input-channel/LSP32265_P202.ome.tif,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro-cp3
+LSP31116,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro/input-channel/LSP31116_P202.ome.tif,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro-cp3
+LSP31747,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro/input-channel/LSP31747_P202.ome.tif,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro-cp3
+LSP31755,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro/input-channel/LSP31755_P202.ome.tif,/n/scratch/users/y/yc296/P202_exp11_10cycles_CYCIF_registered_files/mcmicro-cp3
 """.strip().split("\n")
 
-for ii in slide_ids:
-    print(f"\nProcessing slide {ii} ...")
-    img_path = pathlib.Path(
-        rf"W:\cycif-production\134-Liposarcoma\P134_exp6_CYCIF_AbTest_A51\McMicro\registration images\{ii}.ome.tif"
-    )
-    out_dir = pathlib.Path(
-        rf"W:\cycif-production\134-Liposarcoma\P134_exp6_CYCIF_AbTest_A51\McMicro\segmentation\{ii}\segmentation\cellpose"
-    )
+
+def run(config, idx):
+    row = config[idx]
+
+    name, img_path, _out_dir = row.split(",")
+    img_path = pathlib.Path(img_path)
+    _out_dir = pathlib.Path(_out_dir)
+    img_name = re.sub(r"\.ome\.tif{1,2}$", "", img_path.name, flags=re.IGNORECASE)
+
+    print(f"\nProcessing slide {name} ...")
+    out_dir = _out_dir / name / "segmentation" / img_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mask_path = segment_slide(
@@ -322,14 +350,32 @@ for ii in slide_ids:
         channel=0,
         out_dir=out_dir,
         intensity_p0=0.1,
-        intensity_p1=99.9,
-        intensity_gamma=0.7,
-        diameter=20.0,
+        intensity_p1=99.95,
+        intensity_gamma=0.9,
+        diameter=12.0,
         flow_threshold=0.4,
+        min_size=0.5 * (12.0 / 2) ** 2 * np.pi,
     )
 
     make_qc_image(
-        img_path, mask_path, out_dir, channel=0, intensity_p0=0.1, intensity_p1=99.9
+        img_path, mask_path, out_dir, channel=0, intensity_p0=0.1, intensity_p1=99.95
     )
     d_mask_path = dilate_slide_mask(mask_path, radius=3, out_dir=out_dir)
     difference_mask_from_file(d_mask_path, mask_path, out_dir)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run segmentation pipeline for a specific config index."
+    )
+    parser.add_argument(
+        "index", type=int, help="Index of the config row to process (starting from 0)."
+    )
+    args = parser.parse_args()
+
+    if args.index < 0 or args.index >= len(config):
+        print(f"Error: index {args.index} is out of range (0 to {len(config) - 1})")
+    else:
+        run(config, args.index)
