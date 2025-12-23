@@ -2,7 +2,9 @@
 #                              Process large image                             #
 # ---------------------------------------------------------------------------- #
 import datetime
+import inspect
 import pathlib
+import re
 import time
 
 import cellpose.models
@@ -16,18 +18,31 @@ import skimage.segmentation
 import torch
 import zarr
 
+
 dn_model = cellpose.models.CellposeModel(gpu=True, pretrained_model="cpsam")
 
 
-def segment_tile(timg, diameter, flow_threshold):
+def segment_tile(timg, diameter, flow_threshold, **kwargs):
+    # Get valid argument names for dn_model.eval
+    valid_args = inspect.signature(dn_model.eval).parameters.keys()
+    # Build the argument dict for eval
+    eval_kwargs = {
+        "x": timg,
+        "diameter": diameter,
+        "flow_threshold": flow_threshold,
+        "normalize": False,
+    }
+    # Add only valid kwargs
+    for k, v in kwargs.items():
+        if k in valid_args:
+            eval_kwargs[k] = v
+        else:
+            print(
+                f"Warning: '{k}' is not a valid argument for model.eval and will be ignored."
+            )
+
     with torch.no_grad():
-        tmask = dn_model.eval(
-            timg,
-            diameter=diameter,
-            # inputs are globally normalized already
-            normalize=False,
-            flow_threshold=flow_threshold,
-        )[0]
+        tmask = dn_model.eval(**eval_kwargs)[0]
 
     if np.all(tmask == 0):
         return tmask.astype("bool")
@@ -71,6 +86,7 @@ def segment_slide(
     intensity_gamma=1.0,
     diameter=15.0,
     flow_threshold=0.4,
+    **kwargs,
 ):
     """
     Process a slide image with Cellpose denoising and segmentation.
@@ -90,43 +106,73 @@ def segment_slide(
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(exist_ok=True, parents=True)
 
-    _img = reader.pyramid[channel][0]
+    _img = reader.pyramid[0][channel]
+    assert np.ndim(_img) in [2, 3]
 
-    with dask.diagnostics.ProgressBar():
-        p0, p1 = np.percentile(_img.compute(), [intensity_p0, intensity_p1])
-    in_range = (p0, p1)
-    print("intensity range:", np.round(in_range, decimals=2))
+    if np.ndim(_img) == 2:
+        _img = _img[np.newaxis]
+        channel = [channel]
 
-    chunksize = _img.chunksize
-    if all(np.less(chunksize, 2048)):
-        _img = _img.rechunk(tuple(cc * 2 for cc in chunksize))
-    _img = _img.map_blocks(
-        adjust_intensity,
-        intensity_in_range=in_range,
-        intensity_gamma=intensity_gamma,
-        dtype="float32",
-    )
-    _img = da_to_zarr(_img)
+    channels = []
+    # cellpose SAM takes <=3 channels
+    for cimg, ii, _ in zip(_img, channel, range(3)):
+        with dask.diagnostics.ProgressBar():
+            ss = np.ceil(np.prod(cimg.shape) / (10_000**2)).astype("int")
+            p0, p1 = np.percentile(
+                cimg[::ss, ::ss].compute(), [intensity_p0, intensity_p1]
+            )
+        in_range = (p0, p1)
+        print(f"intensity range ({ii}):", np.round(in_range, decimals=2))
 
-    img = da.from_zarr(_img, name=False)
+        chunksize = cimg.chunksize
+        if all(np.less(chunksize, 2048)):
+            r_factor = int(np.ceil(np.divide(2048, chunksize)).min())
+            cimg = cimg.rechunk(tuple(cc * r_factor for cc in chunksize))
+        cimg = cimg.map_blocks(
+            adjust_intensity,
+            intensity_in_range=in_range,
+            intensity_gamma=intensity_gamma,
+            dtype="float32",
+        )
+        channels.append(da_to_zarr(cimg, zarr_store=zarr.TempStore()))
+
+    img = da.array([da.from_zarr(cc, name=False) for cc in channels])
+    if len(img) > 1:
+        img = img.rechunk((-1, *img.chunksize[1:]))
 
     _binary_mask = img.map_overlap(
         segment_tile,
-        depth={0: 128, 1: 128},
+        depth={0: 0, 1: 128, 2: 128},
         boundary="none",
         dtype=bool,
+        drop_axis=0,
         diameter=diameter,
         flow_threshold=flow_threshold,
+        **kwargs,
     )
     print("run cellpose; number of chunks:", _binary_mask.numblocks)
 
     _binary_mask = da_to_zarr(_binary_mask, num_workers=2)
     binary_mask = da.from_zarr(_binary_mask, name=False)
 
+    out_path_binary = (
+        out_dir / f"_{reader.path.name.split('.')[0]}-cellpose-nucleus-binary.ome.tif"
+    )
+    palom.pyramid.write_pyramid(
+        [binary_mask.astype("uint8")],
+        out_path_binary,
+        pixel_size=reader.pixel_size,
+        downscale_factor=2,
+        tile_size=1024,
+        compression="zlib",
+        save_RAM=True,
+        is_mask=True,
+    )
+
     end = int(time.perf_counter())
     print("\nelapsed (cellpose):", datetime.timedelta(seconds=end - start))
 
-    _labeled_mask = dask_image.ndmeasure.label(binary_mask)[0]
+    _labeled_mask = dask_image.ndmeasure.label(binary_mask.rechunk(4096))[0]
     labeled_mask = da_to_zarr(_labeled_mask)
 
     end_label = int(time.perf_counter())
@@ -224,7 +270,7 @@ def make_qc_image(
     reader_mask = palom.reader.OmePyramidReader(mask_path)
     out_path = out_dir / f"{reader.path.name.split('.')[0]}-cellpose-qc.ome.tif"
 
-    img = reader.pyramid[channel][0]
+    img = reader.pyramid[0][channel]
     mask = reader_mask.pyramid[0][0]
 
     outline = mask.map_blocks(mask_to_contour, dtype="bool").map_blocks(
@@ -288,40 +334,63 @@ def difference_mask_from_file(path_1, path_2, out_dir):
     return
 
 
-slide_ids = """
-LSP33234
-LSP33249
-LSP33849
-LSP33850
-LSP33851
-LSP33869
-LSP33870
-LSP33871
+config = r"""
+P183_10_C1,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\registration\P183_10_C1.ome.tif,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\mcmicro
+P183_84_C2,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\registration\P183_84_C2.ome.tif,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\mcmicro
+P183_BOT0007,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\registration\P183_BOT0007.ome.tif,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\mcmicro
+P183_MGH23058,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\registration\P183_MGH23058.ome.tif,\\research.files.med.harvard.edu\HITS\lsp-analysis\cycif-production\183-Gray_Breast\P183_Leif_BRCA_Pysed\mcmicro
 """.strip().split("\n")
 
-for ii in slide_ids:
-    print(f"\nProcessing slide {ii} ...")
-    img_path = pathlib.Path(
-        rf"W:\cycif-production\134-Liposarcoma\P134_exp6_CYCIF_AbTest_A51\McMicro\registration images\{ii}.ome.tif"
-    )
-    out_dir = pathlib.Path(
-        rf"W:\cycif-production\134-Liposarcoma\P134_exp6_CYCIF_AbTest_A51\McMicro\segmentation\{ii}\segmentation\cpsam"
-    )
+
+def run(config, idx):
+    row = config[idx]
+
+    name, img_path, _out_dir = row.split(",")
+    img_path = pathlib.Path(img_path)
+    _out_dir = pathlib.Path(_out_dir)
+    img_name = re.sub(r"\.ome\.tif{1,2}$", "", img_path.name, flags=re.IGNORECASE)
+
+    print(f"\nProcessing slide {name} ...")
+    out_dir = _out_dir / name / "segmentation" / img_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     mask_path = segment_slide(
         img_path,
-        channel=0,
+        channel=[0],
         out_dir=out_dir,
         intensity_p0=0.1,
-        intensity_p1=99.9,
-        intensity_gamma=0.7,
+        intensity_p1=99.95,
+        intensity_gamma=1,
         diameter=20.0,
-        flow_threshold=0.4,
+        flow_threshold=0.6,
+        batch_size=8,
+        min_size=0.5 * (15.0 / 2) ** 2 * np.pi,
     )
 
     make_qc_image(
-        img_path, mask_path, out_dir, channel=0, intensity_p0=0.1, intensity_p1=99.9
+        img_path,
+        mask_path,
+        out_dir,
+        channel=0,
+        intensity_p0=0.1,
+        intensity_p1=99.95,
     )
-    d_mask_path = dilate_slide_mask(mask_path, radius=3, out_dir=out_dir)
+    d_mask_path = dilate_slide_mask(mask_path, radius=5, out_dir=out_dir)
     difference_mask_from_file(d_mask_path, mask_path, out_dir)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Run segmentation pipeline for a specific config index."
+    )
+    parser.add_argument(
+        "index", type=int, help="Index of the config row to process (starting from 0)."
+    )
+    args = parser.parse_args()
+
+    if args.index < 0 or args.index >= len(config):
+        print(f"Error: index {args.index} is out of range (0 to {len(config) - 1})")
+    else:
+        run(config, args.index)
