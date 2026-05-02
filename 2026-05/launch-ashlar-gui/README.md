@@ -54,7 +54,7 @@ quotes are stripped automatically), or picked with the **…** browse button.
 | ------------------------- | ------- | --------------------------------------------------------------------------- |
 | **From slide / To slide** | 0 / all | Process only a slice of the CSV (0-based, *To* is exclusive)                |
 | **Max jobs**              | 1       | Number of slides processed in parallel                                      |
-| **Max shift µm**          | 30      | Maximum per-tile corrective shift passed to ashlar (`-m`)                   |
+| **Max shift µm**          | 30      | Maximum allowed per-tile shift passed to ashlar (`-m`)                      |
 | **Filter σ**              | 1.0     | Gaussian pre-filter sigma in pixels (`--filter-sigma`). Set to 0 to disable |
 | **Dry run**               | off     | Print ashlar commands without executing them                                |
 | **Skip existing**         | off     | Skip any slide whose output OME-TIFF already exists                         |
@@ -130,7 +130,7 @@ nested one folder deep are found without shortcuts.
 
 A plain text file with **one channel name per line**, no header:
 
-```csv
+```txt
 DAPI
 CD45
 CD3
@@ -201,3 +201,4 @@ pixi run python run-ashlar.py slides.csv --markers markers.csv --max-n-jobs 4
 ```
 
 Run `pixi run python run-ashlar.py --help` for all options.
+m
