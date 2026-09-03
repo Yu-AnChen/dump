@@ -7,39 +7,32 @@ version = "0.1.0"
 [dependencies]
 python = "3.13.*"
 
-# QuPath 0.7.x -> DJL 0.36.0 -> PyTorch 2.7.1 -> CUDA 12.8
-# These wheels bundle the CUDA/cuDNN DLLs that DJL needs.
+# QuPath 0.7.x -> DJL 0.36.0 -> PyTorch 2.7.1 -> CUDA 12.8. The wheels are here
+# for the CUDA/cuDNN DLLs they bundle, not to be imported.
 # https://qupath.readthedocs.io/en/stable/docs/deep/gpu.html
 [pypi-dependencies]
 torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" }
 torchvision = { version = "==0.22.1", index = "https://download.pytorch.org/whl/cu128" }
 
-# Pins which native PyTorch build DJL downloads. Literal values only: $VAR does
-# not expand here on Windows, so anything using CONDA_PREFIX goes in a task cmd.
+# Literal values only: $VAR does not expand here on Windows.
 [activation.env]
 PYTORCH_FLAVOR = "cu128"
 
-# Download + unzip QuPath. Cached via `outputs`, so it runs once.
 [tasks.get-qupath]
 cmd = "curl -L -o qupath.zip https://github.com/qupath/qupath/releases/download/v0.7.0/QuPath-v0.7.0-Windows.zip && python -m zipfile -e qupath.zip qupath/QuPath-v0.7.0 && rm qupath.zip"
 outputs = ["qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe"]
 
-# Is CUDA available in the env? Non-zero exit if not.
 [tasks.check-cuda]
 cmd = 'python -c "import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"'
 
-# Launch QuPath with torch's CUDA/cuDNN DLLs on PATH. The export is load-bearing:
-# DJL ships cublas64_12.dll but not everything it links against, so without it
-# the engine dies with UnsatisfiedLinkError "Can't find dependent libraries".
-# The Deep Java Library extension ships inside QuPath 0.7.0, nothing to install.
-# Extra args are passed through to QuPath.
+# The PATH export is load-bearing: DJL ships cublas64_12.dll but not everything
+# it links against, and those resolve from torch\lib (else UnsatisfiedLinkError).
 [tasks.launch]
 cmd = 'export PATH="$CONDA_PREFIX\Lib\site-packages\torch\lib;$PATH" && "qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe"'
 depends-on = ["get-qupath"]
 
-# Is CUDA available to QuPath? getEngine(_, true) does the engine download
-# that Extensions > Deep Java Library > Manage DJL Engines otherwise asks for
-# (GBs, once, into %USERPROFILE%\.djl.ai). getGpuCount is on Engine, not Device.
+# getEngine(_, true) also does the one-time engine download into
+# %USERPROFILE%\.djl.ai that Manage DJL Engines otherwise asks you to click.
 [tasks.check-gpu]
 cmd = '''export PATH="$CONDA_PREFIX\Lib\site-packages\torch\lib;$PATH" && "qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe" script -c "import qupath.ext.djl.DjlTools; def e = DjlTools.getEngine(DjlTools.ENGINE_PYTORCH, true); println e; assert e.getGpuCount() > 0 : 'engine loaded but no GPU visible'"'''
 depends-on = ["get-qupath"]
