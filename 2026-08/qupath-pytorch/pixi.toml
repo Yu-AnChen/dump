@@ -14,11 +14,12 @@ python = "3.13.*"
 torch = { version = "==2.7.1", index = "https://download.pytorch.org/whl/cu128" }
 torchvision = { version = "==0.22.1", index = "https://download.pytorch.org/whl/cu128" }
 
-# Puts CUDA/cuDNN (bundled in the torch wheels) where QuPath can find them,
-# and pins which native PyTorch build DJL downloads.
+# Pins which native PyTorch build DJL downloads. Literal only: activation.env
+# runs before the env exists and expands $VAR on unix but %VAR% on Windows, so
+# anything needing CONDA_PREFIX goes in a task cmd instead (expanded there by
+# pixi's own shell, identically on every platform).
 [activation.env]
 PYTORCH_FLAVOR = "cu128"
-PATH = '$CONDA_PREFIX;$CONDA_PREFIX\Library\bin;$CONDA_PREFIX\Scripts;$CONDA_PREFIX\Lib\site-packages\torch\lib;$PATH'
 
 # Download + unzip QuPath. Cached via `outputs`, so it runs once.
 [tasks.get-qupath]
@@ -29,15 +30,16 @@ outputs = ["qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe"]
 [tasks.check-cuda]
 cmd = 'python -c "import torch; print(torch.__version__, torch.version.cuda); assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"'
 
-# Launch QuPath. The Deep Java Library extension ships inside QuPath 0.7.0,
-# so there is nothing to install. Extra args are passed through to QuPath.
+# Launch QuPath, with torch's bundled CUDA/cuDNN DLLs on PATH. The Deep Java
+# Library extension ships inside QuPath 0.7.0, so there is nothing to install.
+# Extra args are passed through to QuPath.
 [tasks.launch]
-cmd = '"qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe"'
+cmd = 'export PATH="$CONDA_PREFIX\Lib\site-packages\torch\lib;$PATH" && "qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe"'
 depends-on = ["get-qupath"]
 
 # Is CUDA available to QuPath? getEngine(_, true) does the engine download
 # that Extensions > Deep Java Library > Manage DJL Engines otherwise asks for
 # (GBs, once, into %USERPROFILE%\.djl.ai). getGpuCount is on Engine, not Device.
 [tasks.check-gpu]
-cmd = '''"qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe" script -c "import qupath.ext.djl.DjlTools; def e = DjlTools.getEngine(DjlTools.ENGINE_PYTORCH, true); println e; assert e.getGpuCount() > 0 : 'engine loaded but no GPU visible'"'''
+cmd = '''export PATH="$CONDA_PREFIX\Lib\site-packages\torch\lib;$PATH" && "qupath/QuPath-v0.7.0/QuPath-0.7.0 (console).exe" script -c "import qupath.ext.djl.DjlTools; def e = DjlTools.getEngine(DjlTools.ENGINE_PYTORCH, true); println e; assert e.getGpuCount() > 0 : 'engine loaded but no GPU visible'"'''
 depends-on = ["get-qupath"]
