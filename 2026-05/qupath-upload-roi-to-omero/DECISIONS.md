@@ -625,4 +625,119 @@ Key details:
 
 ---
 
-*Last updated: 2026-05-13*
+## ADR-019 · Pull direction: `roitool export`, reusing the ADR-012 auth path
+
+**Status:** Implemented as `pull_rois_from_omero.groovy`
+
+**Context:**
+ROI upload (ADR-008) had no counterpart for reading ROIs back out of OMERO into QuPath.
+Three options were evaluated:
+
+| Option | Approach | Verdict |
+|--------|----------|---------|
+| A | QuPath OMERO extension's own ROI import | ❌ Not installed on the target machine, and it has no notion of the Pageant "Exclude" convention (ADR-017) |
+| B | OMERO JSON API `GET /api/v0/m/rois/?image=<id>` | ⚠️ Reading works, but it authenticates with Django session cookies — a second auth system alongside the ICE session key we already cache, which cannot authenticate it |
+| C | `ome-omero-roitool export` | ✅ Chosen |
+
+**Decision:**
+roitool's `export` sub-command takes the same options as `import`
+(`--key`, `--server`, `--port`, then `<imageId> <output>`), so the entire front half of
+`send_rois_to_omero_pageant.groovy` carries over unchanged: cached ICE session key
+(ADR-012), auto-downloaded Adoptium JRE (ADR-010), subprocess isolation (ADR-009),
+ICE hostname retry (ADR-015), fatal-error early kill (ADR-016) and the Windows
+`@argfile` invocation (ADR-018). Only the sub-command and the direction of the
+OME-XML conversion differ.
+
+Kept as a separate script rather than a direction flag on the push script, following
+the precedent in ADR-017: each file stays independently readable.
+
+**Why not the web API:**
+ADR-007 established there is no web *write* path for ROIs. A web *read* path does exist,
+but using it would mean maintaining Django cookie auth beside the ICE key — two auth
+systems on independent expiry clocks (see the note in ADR-012) for no gain, since the
+ICE key we already hold is what `export` wants.
+
+---
+
+## ADR-020 · OME-XML → QuPath: one object per ROI, Exclude subtracted, Shape `Text` as name
+
+**Status:** Implemented in `pull_rois_from_omero.groovy`
+
+**Context:**
+roitool ships `QuPath.scripts/OME_XML_import.groovy` (Glencoe Software, 2019), which
+already reads OME-XML into QuPath. It was not reused:
+
+- it creates one QuPath object **per shape**, so a MultiPolygon written as one ROI with
+  N polygon shapes returns as N separate objects rather than one
+- it has no notion of the "Exclude" convention (ADR-017), so holes return as filled
+  sibling objects
+- it calls `path.setColorRGB(...)`, which no longer exists in QuPath 0.7 (`setColor`)
+
+**Decision:** convert per OME ROI, not per shape.
+
+| OME-XML | QuPath |
+|---|---|
+| All polygon shapes of one ROI | One object — rings unioned as JTS geometry, then `GeometryTools.geometryToROI` |
+| ROI `Name="Exclude"` | Subtracted from the object that spatially covers it, restoring interior rings |
+| Shape ID containing `.hole.` | Interior ring (base script convention) |
+| MapAnnotation `qupath:class` / `qupath:name` / `qupath:metadata:*` | Class, name, metadata |
+| Shape `Text` | Object name when no `qupath:name` — the inverse of ADR-014 |
+| ROI `Name` | Class when no `qupath:class`, unless the name is generic (below) |
+| `Mask`, `Label` | Skipped with a log line; roitool does not export masks |
+
+**The Exclude asymmetry — bug found in testing:**
+the push script preserves the `.hole.` naming in the Shape IDs *inside* the Exclude ROI.
+A reader that classifies rings by Shape ID therefore files every shape of an Exclude ROI
+as a hole, leaves that ROI with no exterior ring, and drops it silently: holes vanish and
+the object's area comes back too large by exactly the area of the hole. **Within an
+Exclude ROI, those rings are its own exteriors** — the `.hole.` marker is only meaningful
+relative to the ROI that owned the hole. Guarded by a `--selftest` case that fails on
+regression.
+
+**PathViewer-authored ROIs** differ from anything the push script writes:
+
+- no `MapAnnotation` at all — PathViewer stores its metadata as `XMLAnnotation` under the
+  namespace `glencoesoftware.com/pathviewer/roi/settings`, so every `qupath:*` key is absent
+- every drawn shape is named `Annotation`, which would otherwise become a QuPath class on
+  every object pulled; `GENERIC_ROI_NAMES` drops it, while meaningful names such as
+  Pageant's `Include` are kept as the class
+- the user-visible label lives in Shape `Text` (e.g. `Hotspot1`), hence Text → name
+
+---
+
+## ADR-021 · Export timeout must be total wall-clock, not idle
+
+**Status:** Implemented in `pull_rois_from_omero.groovy`
+
+**Context:**
+The push script caps the roitool subprocess at 120 s total, with ADR-016's fatal-error
+early kill layered on top. Reusing that budget for `export` killed healthy exports.
+
+**Measured** — `brontes` slide 4318, LAN server:
+
+| ROIs | Export | OME-XML | Import into QuPath |
+|---|---|---|---|
+| 1118 | 244 s | 1.0 MB | 0.6 s |
+
+roitool logs `ROI export started` about 2 s in and then prints **nothing at all** until it
+writes the finished file — no progress, no partial output on disk. Consequences:
+
+1. An idle/output-based timeout cannot work: silence is the normal state during the fetch.
+   The budget has to be total wall-clock — `EXPORT_TIMEOUT_SEC = 1800`, roughly 9000 ROIs
+   at the measured ~0.2 s per ROI.
+2. A timeout is now reported *as* a timeout, naming the constant to raise. Previously the
+   force-kill surfaced as `roitool exited with code -1` with an empty log — indistinguishable
+   from a crash — and the `finally` block then deleted the temp file, leaving nothing to inspect.
+3. A heartbeat is printed every 30 s while waiting, so a slow export looks slow rather than hung.
+
+Fetching dominates end to end: the OME-XML → QuPath conversion is ~0.2% of total runtime,
+so there is no value in optimising the import side.
+
+**Also:** `SUBPROCESS_HEAP` (default `4g`) is passed to the subprocess as `JAVA_OPTS` on
+macOS/Linux — the Gradle start script forwards `JAVA_OPTS`, `DEFAULT_JVM_OPTS` and
+`OME_OMERO_ROITOOL_OPTS` — and as `-Xmx` in the `@argfile` on Windows, where the `.bat` is
+bypassed (ADR-018).
+
+---
+
+*Last updated: 2026-09-14*
