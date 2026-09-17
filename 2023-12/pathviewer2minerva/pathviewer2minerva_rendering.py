@@ -67,13 +67,13 @@ def get_img_metadata(omero_url, img_id, session):
         omero_url.pop(-1)
 
     r = session.get(
-        f"{omero_url}/pathviewer/imgData/{img_id}/?callback=angular.callbacks._0"
+        f"{omero_url}/pathviewer/imgData/{img_id}/"
     )
     if r.status_code != 200:
         print(f"Failed getting metadata for {img_id} from {omero_url}")
         print(f"{r.status_code}: {r.reason}")
         return None
-    metadata = json.loads(r.text.replace("angular.callbacks._0(", "")[:-1])
+    metadata = json.loads(r.text)
     return metadata
 
 
