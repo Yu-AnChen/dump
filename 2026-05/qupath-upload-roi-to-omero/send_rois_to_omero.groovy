@@ -1,7 +1,13 @@
 /**
  * send_rois_to_omero.groovy
  *
- * Sends QuPath ROIs to OMERO via ome-omero-roitool.
+ * Sends QuPath ROIs to OMERO via ome-omero-roitool. Reverse: pull_rois_from_omero.groovy.
+ *
+ * HOLE_MODE picks how polygon holes (interior rings) are written (ADR-017, ADR-023):
+ *   "exclude" — a separate ROI named "Exclude"; Pageant subtracts spatially contained
+ *               Exclude ROIs from their enclosing ROI when computing measurements
+ *   "union"   — ".hole." polygon shapes inside the object's own ROI
+ * pull_rois_from_omero.groovy reads both back into holes.
  *
  * What this script does:
  *   1. Downloads and caches ome-omero-roitool (once, ~77MB)
@@ -9,6 +15,7 @@
  *   3. Extracts OMERO server host and image ID from the currently open image URI
  *   4. Resolves credentials: cached ICE session key → password prompt → web login for session key
  *   5. Exports all annotations + detections to a temp OME-XML file
+ *      (polygon holes written per HOLE_MODE)
  *   6. Runs ome-omero-roitool as a subprocess (keeps QuPath alive)
  *   7. Cleans up the temp file
  *
@@ -20,13 +27,24 @@
  */
 
 // ── User-configurable ──────────────────────────────────────────────────────────
+// ==== SHARED BEGIN config — keep identical in push/pull scripts (check_shared.py) ====
 ROITOOL_VERSION  = "0.2.7"
 OMERO_PORT       = 4064
 JRE_VERSION      = "21"
-// Optional: set if your OMERO Blitz/ICE server has a different hostname than
-// the web frontend (e.g. omero-blitz.server.com vs omero-web.server.com).
-// Leave as "" to use the hostname parsed from the image URL.
+// Set if your OMERO Blitz/ICE server has a different hostname than the web
+// frontend. Leave as "" to use the cached host, else the image URL's host; a wrong
+// host prompts once and the answer is cached (ADR-015).
 OMERO_ICE_HOST   = ""
+// Heap for the roitool subprocess. Images with many thousands of ROIs need more
+// than the JVM default; raise if roitool dies with OutOfMemoryError.
+SUBPROCESS_HEAP  = "4g"
+// Total wall-clock budget for one roitool run. roitool prints NOTHING while it
+// transfers, so this cannot be an idle timeout. Measured: 1118 ROIs took 244s to
+// export from a LAN OMERO server, ~0.2s per ROI (ADR-021). Raise for huge images.
+ROITOOL_TIMEOUT_SEC = 1800
+// ==== SHARED END config ====
+// How polygon holes are written: "exclude" (Pageant) or "union" — see the header.
+HOLE_MODE = "exclude"
 // ──────────────────────────────────────────────────────────────────────────────
 
 import java.net.URI
@@ -59,7 +77,50 @@ boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win")
 def userDir = PathPrefs.userPathProperty().get() ?:
     new File(System.getProperty("user.home"), ".qupath-roitool").absolutePath
 new File(userDir).mkdirs()
+if (!(HOLE_MODE in ["exclude", "union"]))
+    throw new IllegalArgumentException("HOLE_MODE must be \"exclude\" or \"union\", not \"${HOLE_MODE}\"")
 
+// ── Self-test: hole writing in both HOLE_MODEs, no OMERO or image needed ───────
+// QuPath CLI: QuPath script send_rois_to_omero.groovy -a --selftest
+if (binding.hasVariable('args') && (args as List).contains('--selftest')) {
+    def gf = GeometryTools.getDefaultFactory()
+    def ring = { double a, double b -> gf.createLinearRing([[a, a], [b, a], [b, b], [a, b], [a, a]]
+        .collect { new org.locationtech.jts.geom.Coordinate(it[0], it[1]) } as org.locationtech.jts.geom.Coordinate[]) }
+    def holed = gf.createPolygon(ring(0, 100), [ring(25, 75)] as org.locationtech.jts.geom.LinearRing[])
+    def obj = qupath.lib.objects.PathObjects.createAnnotationObject(
+        GeometryTools.geometryToROI(holed, qupath.lib.regions.ImagePlane.getDefaultPlane()),
+        qupath.lib.objects.classes.PathClass.fromString("Stroma"))
+    // mode → [ROIs emitted, ROI names, ".hole." shapes per ROI]
+    [exclude: [2, ["Stroma", "Exclude"], [0, 1]],
+     union:   [1, ["Stroma"],            [1]]].each { mode, want ->
+        HOLE_MODE = mode
+        def ome = new OME()
+        int n = addROI(obj.getROI(), obj, 0, ome, new StructuredAnnotations())
+        def rois = ome.copyROIList()
+        def holes = rois.collect { r -> r.union.copyShapeList().count { it.ID.contains(".hole.") } }
+        assert [n, rois*.name, holes] == want : "HOLE_MODE ${mode}: got ${[n, rois*.name, holes]}, want ${want}"
+    }
+    println "selftest OK"
+    return
+}
+
+// ==== SHARED BEGIN session-cache — keep identical in push/pull scripts (check_shared.py) ====
+// Session cache shared by the push and pull scripts (ADR-012): ICE host, username
+// and session key — never the password.
+def credsFile   = new File(userDir, ".omero_qupath_creds")
+def cachedProps = new Properties()
+if (credsFile.exists()) credsFile.withInputStream { cachedProps.load(it) }
+
+def saveCache = { String iceHost, String user, String key ->
+    def props = new Properties()
+    props.setProperty("ice_host",    iceHost ?: "")
+    props.setProperty("username",    user ?: "")
+    props.setProperty("session_key", key ?: "")
+    credsFile.withOutputStream { props.store(it, "QuPath OMERO session cache — delete to reset") }
+}
+// ==== SHARED END session-cache ====
+
+// ==== SHARED BEGIN provisioning — keep identical in push/pull scripts (check_shared.py) ====
 // ── Download helper ───────────────────────────────────────────────────────────
 def downloadWithProgress = { url, dest, label ->
     print("Downloading ${label}...")
@@ -87,20 +148,13 @@ def downloadWithProgress = { url, dest, label ->
     print("  done (${String.format('%.1f', downloaded / 1024.0 / 1024.0)} MB)")
 }
 
-// ── Step 0: Resolve roitool binary ────────────────────────────────────────────
+// ── Resolve roitool binary (ADR-008) ──────────────────────────────────────────
 def toolDir = new File(userDir, "ome-omero-roitool-${ROITOOL_VERSION}")
 def toolZip = new File(userDir, "ome-omero-roitool-${ROITOOL_VERSION}.zip")
-def exeName = isWindows ? "ome-omero-roitool.bat" : "ome-omero-roitool"
+// runRoitool starts roitool as plain Java on these jars; nothing else in the zip is used
+def toolLib = new File(toolDir, "lib")
 
-def findExe = { File dir ->
-    def found = null
-    if (dir.exists()) dir.eachFileRecurse { f -> if (!f.directory && f.name == exeName) found = f }
-    return found
-}
-
-def toolExe = findExe(toolDir)
-
-if (toolExe == null) {
+if (!toolLib.isDirectory()) {
     def downloadUrl = "https://github.com/glencoesoftware/ome-omero-roitool/releases/download/" +
                       "v${ROITOOL_VERSION}/ome-omero-roitool-${ROITOOL_VERSION}.zip"
     try {
@@ -115,23 +169,20 @@ if (toolExe == null) {
             }
         }
         toolZip.delete()
-        toolExe = findExe(toolDir)
-        if (toolExe == null) {
-            Dialogs.showErrorMessage("Install failed", "Could not find '${exeName}' after extracting.")
+        if (!toolLib.isDirectory()) {
+            Dialogs.showErrorMessage("Install failed", "No ${toolLib} after extracting.")
             return
         }
-        if (!isWindows) toolExe.setExecutable(true)
-        print("Downloaded roitool: ${toolExe.absolutePath}")
+        print("Downloaded roitool: ${toolDir.absolutePath}")
     } catch (Exception e) {
         Dialogs.showErrorMessage("Download failed", "Could not download ome-omero-roitool:\n${e.message}")
         return
     }
 } else {
-    print("Using cached roitool: ${toolExe.absolutePath}")
-    if (!isWindows && !toolExe.canExecute()) toolExe.setExecutable(true)
+    print("Using cached roitool: ${toolDir.absolutePath}")
 }
 
-// ── Step 1: Resolve Java (auto-downloaded Adoptium JRE) ───────────────────────
+// ── Resolve Java: auto-downloaded Adoptium JRE (ADR-010) ──────────────────────
 def osName    = System.getProperty("os.name").toLowerCase()
 def osArch    = System.getProperty("os.arch").toLowerCase()
 def adoptOs   = osName.contains("win") ? "windows" : osName.contains("mac") ? "mac" : "linux"
@@ -209,10 +260,121 @@ if (jreExeMac.exists()) {
         return
     }
 }
+// ==== SHARED END provisioning ====
+
+// ==== SHARED BEGIN roitool-runner — keep identical in push/pull scripts (check_shared.py) ====
+// ── roitool subprocess (ADR-009/016/021/026) ─────────────────────────────────
+// roitool runs as a subprocess so ICE's System.exit() kills only the child, not QuPath.
+
+// The password never goes on the command line, where any process can read it.
+// roitool's --password is a picocli interactive option: given with no value it reads
+// the password from stdin (runRoitool's stdinText). It must come last, because its
+// optional value (arity 0..1) would otherwise swallow the image ID.
+def roitoolAuthArgs = { String key, String user, String imageId, String path ->
+    key ? ["--key", key, imageId, path] : ["--username", user, imageId, path, "--password"]
+}
+
+// subcommand: "import" or "export". stdinText: the password when not using a key, else null.
+// roitool runs as plain Java with the lib/* classpath wildcard on every OS: no launcher
+// script, no cmd.exe line-length limit, no environment to set up (ADR-026).
+def runRoitool = { String subcommand, String iceHost, List authArgs, String stdinText ->
+    def java = new File(javaHome.toString(), isWindows ? "bin/java.exe" : "bin/java").absolutePath
+    def cmd = [java, "-Xmx" + SUBPROCESS_HEAP, "-cp", new File(toolLib, "*").absolutePath,
+               "com.glencoesoftware.roitool.Main",
+               subcommand, "--server", iceHost, "--port", OMERO_PORT.toString()] + authArgs
+    def proc = new ProcessBuilder(cmd*.toString()).redirectErrorStream(true).start()
+    proc.outputStream.withWriter("UTF-8") { w -> if (stdinText != null) w.write(stdinText + "\n") }
+    def output = new StringBuilder()
+    // ICE threads keep the JVM alive after roitool's main thread dies, so the
+    // process never exits on a fatal error; kill it 5s after one is seen (ADR-016).
+    // Any uncaught main-thread exception counts, e.g. "Obtained null object proxy"
+    // from a wrong ICE host, not just the named connection/auth errors.
+    def fatalSeen = new java.util.concurrent.atomic.AtomicBoolean(false)
+    def reader = Thread.start {
+        proc.inputStream.eachLine { line ->
+            print(line); output.append(line).append("\n")
+            if (line.startsWith("Exception in thread \"main\"") ||
+                    line.contains("ConnectionRefusedException") ||
+                    line.contains("PermissionDeniedException") ||
+                    line.contains("Connection refused"))
+                fatalSeen.set(true)
+        }
+    }
+    long startMs = System.currentTimeMillis()
+    long nextTick = 30000
+    boolean timedOut = false
+    while (proc.isAlive()) {
+        if (proc.waitFor(500, TimeUnit.MILLISECONDS)) break
+        long elapsedMs = System.currentTimeMillis() - startMs
+        // Heartbeat: roitool is silent while transferring, so without this a slow
+        // run is indistinguishable from a hang (ADR-021).
+        if (elapsedMs >= nextTick) {
+            print("  ...roitool ${subcommand} still running (${(long)(elapsedMs / 1000)}s elapsed)")
+            nextTick += 30000
+        }
+        long elapsedSec = elapsedMs / 1000
+        if (elapsedSec > ROITOOL_TIMEOUT_SEC) { timedOut = true; break }
+        if (elapsedSec > 5 && fatalSeen.get()) break
+    }
+    if (proc.isAlive()) proc.destroyForcibly().waitFor(5, TimeUnit.SECONDS)
+    reader.join(2000)
+    [exitCode: proc.isAlive() ? -1 : proc.exitValue(), output: output.toString(),
+     timedOut: timedOut, elapsedSec: (long)((System.currentTimeMillis() - startMs) / 1000),
+     iceHost: iceHost]
+}
+
+// null on success, else "timeout", "ice-unreachable" (refused, or a reachable host
+// that is not a Blitz server, e.g. the web host: "null object proxy"), "auth"
+// (rejected or expired key/password) or "failed".
+def roitoolFailure = { Map result ->
+    if (result.timedOut) return "timeout"
+    if (result.exitCode == 0) return null
+    def out = result.output.toLowerCase()
+    if (out.contains("connectionrefused") || out.contains("connection refused") ||
+            out.contains("null object proxy")) return "ice-unreachable"
+    if (out.contains("permission") || out.contains("glacier") || out.contains("password check"))
+        return "auth"
+    return "failed"
+}
+
+// Interactive: on an unreachable ICE host, ask for the right one and retry once (ADR-015).
+// The returned result's iceHost is the host actually used.
+def runWithIceRetry = { String subcommand, String iceHost, List authArgs, String stdinText ->
+    def result = runRoitool(subcommand, iceHost, authArgs, stdinText)
+    if (roitoolFailure(result) != "ice-unreachable") return result
+    def altHost = Dialogs.showInputDialog("ICE host unreachable",
+        "Could not connect to ${iceHost}:${OMERO_PORT}.\n" +
+        "Enter the correct ICE/Blitz hostname to retry\n" +
+        "(set OMERO_ICE_HOST in the script header to avoid this prompt):",
+        iceHost)
+    if (!altHost?.trim()) return result
+    print("Retrying with ICE host: ${altHost.trim()}")
+    return runRoitool(subcommand, altHost.trim(), authArgs, stdinText)
+}
+
+// Interactive: explains a failed run. A rejected session key clears only the key,
+// keeping the ICE host, so a split web/ICE server is not re-prompted (ADR-015).
+def reportRoitoolFailure = { String failure, Map result, String action, String user, boolean usedKey ->
+    if (failure == "timeout") {
+        Dialogs.showErrorMessage("${action} timed out",
+            "roitool was still running after ${result.elapsedSec}s and was stopped.\n" +
+            (action == "Upload" ? "Some ROIs may already be on OMERO — check before re-running.\n" : "") +
+            "\nRaise ROITOOL_TIMEOUT_SEC (${ROITOOL_TIMEOUT_SEC}s) at the top of the script and run again.")
+    } else if (failure == "auth" && usedKey) {
+        saveCache(result.iceHost, user, "")
+        Dialogs.showWarningNotification("Session expired",
+            "Session expired — cache cleared. Please run the script again to re-authenticate.")
+    } else {
+        Dialogs.showErrorMessage("${action} failed",
+            "roitool exited with code ${result.exitCode}.\n\n${result.output.take(500)}")
+    }
+}
+// ==== SHARED END roitool-runner ====
 
 // ── Step 2: Extract server + image ID ─────────────────────────────────────────
 // Works whether the image was opened from OMERO or from a local file.
 
+// ==== SHARED BEGIN omero-url — keep identical in push/pull scripts (check_shared.py) ====
 def parseOmeroUrl = { String urlStr ->
     def result = [host: null, baseUrl: null, imageId: null]
     if (!urlStr) return result
@@ -239,6 +401,8 @@ def parseOmeroUrl = { String urlStr ->
     } catch (Exception ignored) {}
     return result
 }
+// ==== SHARED END omero-url ====
+
 
 def server      = QP.getCurrentServer()
 def imageUriStr = server?.getURIs()?.first()?.toString() ?: ""
@@ -255,7 +419,7 @@ if (!omeroHost || !imageId) {
     def idField   = new TextField(imageId   ?: "")
     def vbox = new VBox(6,
         new Label("OMERO image URL (paste to auto-fill host + image ID):"), urlField,
-        new Label("OMERO server host (override):"), hostField,
+        new Label("OMERO web host (override, e.g. omero.hms.harvard.edu — not the ICE host):"), hostField,
         new Label("Image ID (override):"),           idField)
     vbox.setPadding(new Insets(10))
     if (!Dialogs.showConfirmDialog("OMERO image details", vbox)) return
@@ -279,28 +443,13 @@ if (!omeroHost || !imageId) {
 }
 
 // ── Step 3: Credentials ───────────────────────────────────────────────────────
-// Tier 1: cached ICE session key → Tier 2: password prompt
-def credsFile   = new File(userDir, ".omero_qupath_creds")
-def cachedProps = new Properties()
-if (credsFile.exists()) credsFile.withInputStream { cachedProps.load(it) }
-
+// ==== SHARED BEGIN credentials — keep identical in push/pull scripts (check_shared.py) ====
 def omeroIceHost = OMERO_ICE_HOST ?: (cachedProps.getProperty("ice_host", "") ?: omeroHost)
 print("Web: ${omeroBaseUrl}  ICE: ${omeroIceHost}:${OMERO_PORT}  Image ID: ${imageId}")
 
-def saveCache = { String iceHost, String user, String key ->
-    def props = new Properties()
-    props.setProperty("ice_host",    iceHost ?: "")
-    props.setProperty("username",    user ?: "")
-    props.setProperty("session_key", key ?: "")
-    credsFile.withOutputStream { props.store(it, "QuPath OMERO session cache — delete to reset") }
-}
-
-def omeroKey  = null
-def omeroUser = null
+def omeroUser = cachedProps.getProperty("username", "") ?: null
+def omeroKey  = cachedProps.getProperty("session_key", "") ?: null
 def omeroPass = null
-
-omeroUser = cachedProps.getProperty("username", "") ?: null
-omeroKey  = cachedProps.getProperty("session_key", "") ?: null
 // Note: ICE session keys cannot be validated here. The web API authenticates via
 // Django session cookies; the ICE session UUID is a separate auth system on port 4064.
 // There is no web endpoint that accepts an ICE UUID to check liveness — that would
@@ -342,7 +491,8 @@ if (!omeroKey) {
         }] as javax.net.ssl.TrustManager[]
         def sslCtx = javax.net.ssl.SSLContext.getInstance("TLS")
         sslCtx.init(null, trustAll, new java.security.SecureRandom())
-        def httpClient = java.net.http.HttpClient.newBuilder().sslContext(sslCtx).build()
+        def httpClient = java.net.http.HttpClient.newBuilder().sslContext(sslCtx)
+            .connectTimeout(java.time.Duration.ofSeconds(15)).build()
 
         // Step 1: get CSRF token
         def tokenResp = httpClient.send(
@@ -386,7 +536,15 @@ if (!omeroKey) {
             return
         }
     } catch (Exception e) {
-        print("Web login failed (${e.message}) — falling back to password auth with roitool.")
+        // Loud, not just printed: without a key nothing is cached, every run prompts
+        // again, and headless pull runs cannot work. The usual cause is a host
+        // override pointing at the ICE server, which does not serve the web API.
+        def why = "${e.class.simpleName}${e.message ? ': ' + e.message : ''}"
+        print("Web login to ${omeroBaseUrl} failed (${why}) — falling back to password auth with roitool.")
+        Dialogs.showWarningNotification("No session key",
+            "Web login to ${omeroBaseUrl} failed (${why}).\n" +
+            "Continuing with password; no session key will be cached.\n" +
+            "The host field must be the OMERO *web* host, not the ICE server.")
     }
 
     // If we got a key, save it; otherwise roitool will do its own auth with --password
@@ -395,6 +553,7 @@ if (!omeroKey) {
         saveCache(omeroIceHost, omeroUser, "")
     }
 }
+// ==== SHARED END credentials ====
 
 // ── Step 4: Export ROIs to a temp OME-XML file ────────────────────────────────
 // Scripts run on a background thread; FileChooser must be shown on the FX thread.
@@ -465,13 +624,14 @@ try {
     def ome = new OME()
     def structuredAnnotations = new StructuredAnnotations()
 
+    // nextROI doubles as both the running index and the total ROI count,
+    // since addROI returns the number of ROIs it emitted (1 normally, 2 when holes
+    // are split into a separate Exclude ROI, HOLE_MODE "exclude").
     int nextROI = 0
     rois.each { PathROIObject path ->
-        addROI(path.getROI(), path, nextROI, ome, structuredAnnotations)
-        nextROI++
+        nextROI += addROI(path.getROI(), path, nextROI, ome, structuredAnnotations)
         if (path.isCell() && path.hasNucleus()) {
-            addROI(path.getNucleusROI(), path, nextROI, ome, structuredAnnotations)
-            nextROI++
+            nextROI += addROI(path.getNucleusROI(), path, nextROI, ome, structuredAnnotations)
         }
     }
     ome.setStructuredAnnotations(structuredAnnotations)
@@ -483,142 +643,24 @@ try {
 }
 
 // ── Step 5: Upload via roitool subprocess ─────────────────────────────────────
-// Roitool runs as a subprocess so ICE's System.exit() kills only the child,
-// leaving QuPath alive.
 print("Uploading ROIs to OMERO...")
 
-// Use --key if we have a session key (from cache or web login), else --username/--password
 if (!omeroKey && !omeroPass) {
     Dialogs.showErrorMessage("Authentication error", "No session key or password available — cannot upload.")
     tempXml.delete()
     return
 }
 
-def roitoolArgs = omeroKey ?
-    ["--key", omeroKey, imageId, tempXml.absolutePath] :
-    ["--username", omeroUser, "--password", omeroPass, imageId, tempXml.absolutePath]
-
-def runRoitool = { String iceHost ->
-    def importArgs = ["import", "--server", iceHost, "--port", OMERO_PORT.toString()] + roitoolArgs
-    def cmd
-    def cpArgFile = null
-
-    if (isWindows) {
-        // Windows cmd.exe has an 8191-char line limit; the roitool .bat hits this when
-        // expanding its classpath inline. Parse the classpath from the .bat directly
-        // and invoke java.exe via a @argfile to keep the command line short.
-        def appHome = toolExe.parentFile.parentFile.absolutePath
-        def classpath = null
-        def mainClass = "com.glencoesoftware.roitool.Main"
-        toolExe.eachLine { line ->
-            def t = line.trim()
-            if (t.startsWith("set CLASSPATH="))
-                classpath = t.substring("set CLASSPATH=".length()).replace("%APP_HOME%", appHome)
-            if (t.contains("-classpath") && t.contains("%*")) {
-                def m = t =~ /\s([a-z][a-zA-Z0-9.]+)\s+%\*/
-                if (m.find()) mainClass = m.group(1)
-            }
-        }
-        if (!classpath) {
-            // Fallback: scan lib/ directly
-            def jars = []
-            new File(appHome, "lib").eachFileRecurse { f ->
-                if (!f.directory && f.name.endsWith(".jar")) jars << f.absolutePath
-            }
-            classpath = jars.join(';')
-        }
-        // Forward slashes avoid backslash-escape issues inside @argfile quoted strings
-        cpArgFile = File.createTempFile("roitool_cp_", ".args")
-        cpArgFile.deleteOnExit()
-        cpArgFile.text = "-cp\n\"${classpath.replace('\\', '/')}\"\n"
-        cmd = [javaHome.toString() + "\\bin\\java.exe",
-               "@" + cpArgFile.absolutePath,
-               mainClass] + importArgs
-    } else {
-        cmd = ["/bin/bash", toolExe.absolutePath] + importArgs
-    }
-
-    def pb = new ProcessBuilder(cmd)
-    pb.redirectErrorStream(true)
-    pb.environment().put("JAVA_HOME", javaHome.toString())
-    pb.environment().put("PATH", javaHome.toString() + (isWindows ? "\\bin;" : "/bin:") +
-        (pb.environment().getOrDefault("PATH", isWindows ? "" : "/usr/bin:/bin")))
-    try {
-        def proc = pb.start()
-        def output = new StringBuilder()
-        // ICE daemon threads keep the subprocess alive after the main thread crashes.
-        // Read output on a background thread, and force-kill the process 5s after
-        // detecting a fatal error rather than waiting for the full 120s timeout.
-        def fatalSeen = new java.util.concurrent.atomic.AtomicBoolean(false)
-        def reader = Thread.start {
-            proc.inputStream.eachLine { line ->
-                print(line); output.append(line).append("\n")
-                if (line.contains("ConnectionRefusedException") ||
-                        line.contains("PermissionDeniedException") ||
-                        line.contains("Connection refused"))
-                    fatalSeen.set(true)
-            }
-        }
-        long startMs = System.currentTimeMillis()
-        while (proc.isAlive()) {
-            if (proc.waitFor(500, TimeUnit.MILLISECONDS)) break
-            long elapsedSec = (System.currentTimeMillis() - startMs) / 1000
-            if (elapsedSec > 120) break
-            if (elapsedSec > 5 && fatalSeen.get()) break
-        }
-        if (proc.isAlive()) proc.destroyForcibly().waitFor(5, TimeUnit.SECONDS)
-        reader.join(2000) // 2s drain
-        [exitCode: proc.isAlive() ? -1 : proc.exitValue(), output: output.toString()]
-    } finally {
-        cpArgFile?.delete()
-    }
-}
-
 try {
-    def effectiveIceHost = omeroIceHost
-    def result = runRoitool(effectiveIceHost)
-
-    // If connection refused, offer to retry with a different ICE hostname
-    if (result.output.toLowerCase().contains("connectionrefused") ||
-            result.output.toLowerCase().contains("connection refused")) {
-        def altHost = Dialogs.showInputDialog("ICE host unreachable",
-            "Could not connect to ${effectiveIceHost}:${OMERO_PORT}.\n" +
-            "Enter the correct ICE/Blitz hostname to retry\n" +
-            "(set OMERO_ICE_HOST in the script header to avoid this prompt):",
-            effectiveIceHost)
-        if (!altHost?.trim()) {
-            Dialogs.showErrorMessage("Upload failed",
-                "roitool exited with code ${result.exitCode}.\n\n${result.output.take(500)}")
-            return
-        }
-        effectiveIceHost = altHost.trim()
-        print("Retrying with ICE host: ${effectiveIceHost}")
-        result = runRoitool(effectiveIceHost)
-    }
-
-    int exitCode = result.exitCode
-    def out = result.output
-
-    if (exitCode == 0) {
-        saveCache(effectiveIceHost, omeroUser, omeroKey)
+    def result = runWithIceRetry("import", omeroIceHost,
+        roitoolAuthArgs(omeroKey, omeroUser, imageId, tempXml.absolutePath), omeroKey ? null : omeroPass)
+    def failure = roitoolFailure(result)
+    if (failure) {
+        reportRoitoolFailure(failure, result, "Upload", omeroUser, omeroKey != null)
+    } else {
+        saveCache(result.iceHost, omeroUser, omeroKey)
         if (omeroKey) print("Session key cached — no password needed next run.")
         Dialogs.showInfoNotification("Success", "ROIs uploaded to OMERO image ${imageId}.")
-    } else {
-        def outLower = out.toLowerCase()
-        // Heuristic: ICE auth errors mention "permission", "glacier", or "password check".
-        // If roitool changes its error messages, this detection silently falls through to the
-        // generic error dialog — clear the cache manually in that case.
-        def authFailure = omeroKey && (outLower.contains("permission") ||
-            outLower.contains("glacier") || outLower.contains("password check"))
-        if (authFailure) {
-            // Clear stale key and ask user to re-run
-            credsFile.delete()
-            Dialogs.showWarningNotification("Session expired",
-                "Session expired — cache cleared. Please run the script again to re-authenticate.")
-        } else {
-            Dialogs.showErrorMessage("Upload failed",
-                "roitool exited with code ${exitCode}.\n\n${out.take(500)}")
-        }
     }
 } catch (Exception e) {
     Dialogs.showErrorMessage("Execution error", "Failed to run ome-omero-roitool:\n${e.message}")
@@ -628,7 +670,9 @@ try {
 
 // ── OME-XML construction helpers ──────────────────────────────────────────────
 
-void addROI(qupath.lib.roi.interfaces.ROI roi, PathROIObject path, int index,
+// Returns the number of OME ROIs emitted (1 for most types; 2 for geometry with
+// holes under HOLE_MODE "exclude", where interior rings become a separate "Exclude" ROI).
+int addROI(qupath.lib.roi.interfaces.ROI roi, PathROIObject path, int index,
             OME ome, StructuredAnnotations structuredAnnotations) {
     def mapAnnotationID = "MapAnnotation-${index}"
     def shapeID         = "Shape:${index}:0"
@@ -715,6 +759,11 @@ void addROI(qupath.lib.roi.interfaces.ROI roi, PathROIObject path, int index,
             if (jtsGeom.geometryType in ["MultiPolygon", "GeometryCollection"]) {
                 for (int gi = 0; gi < jtsGeom.numGeometries; gi++) polys << jtsGeom.getGeometryN(gi)
             } else { polys << jtsGeom }
+
+            // "union": holes ride along as ".hole." shapes of this ROI. "exclude": they
+            // go to a separate Exclude ROI that Pageant subtracts (ADR-017).
+            def holeUnion = HOLE_MODE == "exclude" ? new Union() : union
+
             polys.eachWithIndex { poly, pi ->
                 def coords = poly.exteriorRing?.coordinates ?: poly.coordinates
                 if (!coords) return
@@ -730,10 +779,30 @@ void addROI(qupath.lib.roi.interfaces.ROI roi, PathROIObject path, int index,
                         holeShape.setPoints(poly.getInteriorRingN(hi).coordinates
                             .collect { String.format("%f,%f", it.x, it.y) }.join(" "))
                         setShapeText(holeShape, shapeText); setCommonProps(holeShape, path, roi)
-                        union.addShape(holeShape)
+                        holeUnion.addShape(holeShape)
                     }
                 }
-            }; break
+            }
+
+            if (holeUnion.is(union) || holeUnion.sizeOfShapeList() == 0) break
+
+            // Emit the exterior ROI, then the Exclude ROI for its interior rings
+            omeROI.setUnion(union)
+            omeROI.linkAnnotation(mapAnnotation)
+            ome.addROI(omeROI)
+            structuredAnnotations.addMapAnnotation(mapAnnotation)
+
+            def excludeROI = new ROI()
+            excludeROI.setID("ROI-${index}-exclude")
+            excludeROI.setName("Exclude")
+            def excludeAnnotation = new MapAnnotation()
+            excludeAnnotation.setID("MapAnnotation-${index}-exclude")
+            excludeAnnotation.setValue(new ArrayList<MapPair>(pairList))
+            excludeROI.setUnion(holeUnion)
+            excludeROI.linkAnnotation(excludeAnnotation)
+            ome.addROI(excludeROI)
+            structuredAnnotations.addMapAnnotation(excludeAnnotation)
+            return 2
 
         default:
             print("Unsupported ROI type: ${roi.class.simpleName} — skipped")
@@ -745,6 +814,7 @@ void addROI(qupath.lib.roi.interfaces.ROI roi, PathROIObject path, int index,
         ome.addROI(omeROI)
         structuredAnnotations.addMapAnnotation(mapAnnotation)
     }
+    return 1
 }
 
 static void setShapeText(Shape shape, String text) {

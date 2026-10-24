@@ -393,7 +393,8 @@ without needing the ICE/Blitz protocol at all for auth.
 4. Parse `sessionUuid` from response → this is the ICE key
 5. Cache `{username, session_key}` to `~/.omero_qupath_creds` (Java `.properties` file)
 6. On subsequent runs: load key from cache, skip prompt entirely
-7. On session expiry: roitool exits with permission error → cache cleared → next run re-prompts
+7. On session expiry: roitool exits with permission error → session key cleared (the ICE host
+   is kept, ADR-024) → next run re-prompts
 
 **What is and isn't stored on disk:**
 - ✅ Cached: OMERO username, ICE session UUID
@@ -471,7 +472,7 @@ OME attributes when an object has both name and class.
 
 ## ADR-015 · Split web/ICE hostname: OMERO_ICE_HOST config + connection-refused retry
 
-**Status:** Implemented in `send_rois_to_omero.groovy`
+**Status:** Implemented in both scripts; retry trigger widened and cache kept on expiry by ADR-024
 
 **Context:**  
 Some OMERO deployments expose the web frontend and ICE/Blitz service on different hostnames
@@ -493,7 +494,7 @@ discover the mismatch only when the first run fails.
 
 ## ADR-016 · Subprocess hang fix: background reader thread + fatalSeen early kill
 
-**Status:** Implemented in `send_rois_to_omero.groovy`
+**Status:** Implemented in both scripts; fatal trigger widened by ADR-024
 
 **Context:**  
 When roitool fails with a fatal ICE error (e.g. `ConnectionRefusedException`), its daemon
@@ -515,7 +516,8 @@ Failed connections are detected and killed within ~5 seconds instead of ~120 sec
 
 ## ADR-017 · Pageant variant: "Exclude" ROI for polygon holes
 
-**Status:** Implemented as `send_rois_to_omero_pageant.groovy`
+**Status:** Implemented as `HOLE_MODE = "exclude"` in `send_rois_to_omero.groovy`; the separate
+`_pageant` file is superseded by ADR-023
 
 **Context:**  
 Pageant (Glencoe Software) computes per-object measurements on OMERO ROIs. It does not natively
@@ -548,7 +550,7 @@ in the hot path and to make each script independently readable.
 
 ## ADR-018 · Windows roitool execution: bypass .bat with java.exe + @argfile
 
-**Status:** Implemented in `send_rois_to_omero.groovy` and `send_rois_to_omero_pageant.groovy`
+**Status:** Superseded by ADR-026 (roitool runs as plain Java with a `lib/*` classpath on every OS)
 
 **Context:**  
 On Windows, roitool is distributed as a `.bat` file. When the script first called the `.bat`
@@ -707,7 +709,7 @@ regression.
 
 ## ADR-021 · Export timeout must be total wall-clock, not idle
 
-**Status:** Implemented in `pull_rois_from_omero.groovy`
+**Status:** Implemented; now one `ROITOOL_TIMEOUT_SEC` shared by push and pull (ADR-026)
 
 **Context:**
 The push script caps the roitool subprocess at 120 s total, with ADR-016's fatal-error
@@ -740,4 +742,163 @@ bypassed (ADR-018).
 
 ---
 
-*Last updated: 2026-09-14*
+## ADR-022 · Password goes to roitool on stdin, never on its command line
+
+**Status:** Implemented in both scripts (shared `roitoolAuthArgs` / `runRoitool`)
+
+**Context:**
+When the web login yields no session key (ADR-012), roitool authenticates with the password.
+It was passed as `--password <pw>`, readable by every process on the machine through the
+process list.
+
+**Decision:**
+roitool's `--password` is a picocli `interactive` option with arity `0..1` (read from the
+roitool 0.2.7 jar). Given with no value, picocli prompts, and with no console it reads a line
+from stdin. `runRoitool` writes the password to the subprocess's stdin and closes it.
+`--password` must be the **last** argument: arity `0..1` would otherwise take the image ID as
+its value.
+
+**Verified:** roitool printed `Enter value for --password`, read stdin and went on to connect,
+for both `export` and `import`.
+
+---
+
+## ADR-023 · One push script with `HOLE_MODE`; push/pull shared code kept identical by a check
+
+**Status:** Implemented — `send_rois_to_omero.groovy` (replaces `send_rois_to_omero_pageant.groovy`),
+`check_shared.py`
+
+**Context:**
+ADR-017 kept the Pageant variant as a separate file "to make each script independently
+readable". The two push scripts differed only in where `addROI` puts interior rings, yet
+shared ~770 lines — and the pull script copies another ~400 of them (ADR-019). In practice
+fixes landed in one copy and not the others: on 2026-10-24 the base push script still had
+every bug fixed that day in the other two (password on the command line, 120 s cap, silent
+login fallback, whole cache deleted on expiry, hang on `null object proxy`).
+
+**Decision:**
+1. One push script. `HOLE_MODE = "exclude"` (Pageant, default) or `"union"` (the old base
+   behaviour: `.hole.` shapes inside the object's own ROI). Any other value fails at start-up.
+   `pull_rois_from_omero.groovy` reads both back into holes.
+2. QuPath scripts cannot import each other, so the code push and pull both need lives between
+   `// ==== SHARED BEGIN <name>` / `// ==== SHARED END <name> ====` markers in both files:
+   `config`, `session-cache`, `provisioning`, `roitool-runner`, `omero-url`, `credentials`.
+   `python check_shared.py` fails with a diff if any copy differs. Edit one, paste into the
+   other, run the check.
+3. `--selftest` on the push script asserts the OME-XML written for a square with a hole in
+   both modes (ROI count, names, `.hole.` shapes per ROI).
+
+**Rejected alternative:** a QuPath extension or shared `.groovy` library on the classpath —
+real code sharing, but an install step for every user of what are drop-in scripts.
+
+---
+
+## ADR-024 · Failure handling learned on the HMS deployment (split web/ICE hosts)
+
+**Status:** Implemented in the shared blocks of both scripts. Amends ADR-012, ADR-015, ADR-016.
+
+HMS serves the web API at `omero.hms.harvard.edu` and ICE at `omero-app.hms.harvard.edu:4064`
+(ADR-015). Each item below was a real failure there.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No session key cached; headless runs impossible | Host override pointed at the ICE host, so the web login timed out and the script **silently** fell back to password auth | Login failure shows a notification naming the URL and error; 15 s connect timeout; dialog field labelled *web* host |
+| Export hung for the full timeout | `Obtained null object proxy` (a reachable host that is not Blitz — the web host) is not one of ADR-016's fatal strings; ICE threads keep the JVM alive | Any line starting `Exception in thread "main"` counts as fatal → killed 5 s later |
+| No ICE-host prompt for that failure | ADR-015 retried only on *connection refused* | `null object proxy` also means "ICE host unreachable" → prompt + retry |
+| ICE host re-prompted after every expiry | Session expiry deleted the whole cache file, ICE host included | Expiry clears only `session_key` |
+
+All roitool outcomes go through one classifier, `roitoolFailure` → `null` / `timeout` /
+`ice-unreachable` / `auth` / `failed`, used by the GUI paths of both scripts
+(`reportRoitoolFailure`) and the headless pull path (ADR-027).
+
+---
+
+## ADR-025 · Apply shape `Transform`; check every GeoJSON against its OME-XML
+
+**Status:** Implemented — `readShapes` in `pull_rois_from_omero.groovy`, `check_roi_conversion.groovy`
+
+**Context:**
+PathViewer stores rotated rectangles and ellipses as an axis-aligned shape plus a
+`<Transform A00..A12>` child element. `readShapes` built ROIs from X/Y/Width/Height and never
+read it. Nothing failed: the objects were plausible, just unrotated — up to ~4500 px off.
+Found by eye on one image; the check below then found **9 of 29** images in the first batch
+affected.
+
+**Decision — the transform:**
+Applied per the OME spec, `x' = A00·x + A01·y + A02`, `y' = A10·x + A11·y + A12`: to polygon
+points before rings are assembled, and to the JTS geometry of every other shape. A transformed
+rectangle or ellipse becomes a polygon (QuPath's rectangle/ellipse ROIs cannot rotate).
+`--selftest` pins the convention with a 90° turn plus translation whose envelope differs if the
+matrix were transposed. The inverse was considered: on LSP33010 both directions put a shape
+corner past the image bounds, so bounds cannot decide; the spec direction is what OMERO's
+viewers draw and was confirmed visually against OMERO.
+
+**Decision — the check:** `check_roi_conversion.groovy <folder | file.ome.xml>` (QuPath CLI).
+A geometry comparison alone could not have caught this: a test that also ignored `Transform`
+agrees with the converter. So it does two things:
+1. **Coverage** — every Shape attribute and child element must be listed as applied to
+   geometry or deliberately ignored (style, IDs, planes). Anything else fails the file until
+   someone decides what it means. Verified by deleting `Transform` from the applied list: the
+   check then fails on LSP33010 even though the geometry agreed.
+2. **Geometry** — rebuilds each shape from the raw XML (XmlSlurper, not `OMEXMLMetadata`) per
+   the spec, groups them as ADR-020 describes, and matches GeoJSON features by Hausdorff
+   distance (tolerance 1 px; ellipse polygonisation differs by ~0.1 px).
+
+The batch file runs it over the output folder after every run.
+
+---
+
+## ADR-026 · roitool runs as plain Java with a `lib/*` classpath (supersedes ADR-018)
+
+**Status:** Implemented in the shared `provisioning` and `roitool-runner` blocks
+
+**Context:**
+ADR-018 worked around `cmd.exe`'s 8191-char limit by scraping `CLASSPATH` out of roitool's
+`.bat`, with a jar-scan fallback, into a temporary `@argfile`; macOS/Linux went through the bash
+launcher with `JAVA_HOME`/`JAVA_OPTS`/`PATH` set. Two launch paths, ~35 lines, plus a recursive
+search for the launcher to find the install.
+
+**Decision:**
+Every OS runs `<jre>/bin/java -Xmx<SUBPROCESS_HEAP> -cp <roitool>/lib/* com.glencoesoftware.roitool.Main ...`.
+The JVM launcher expands the `*` classpath wildcard itself, so the command line stays short
+and there is no `.bat` to parse, no argfile, no environment to set. "Installed" means
+`<roitool>/lib` exists. `-Xmx` is now applied on every OS (before, only via `JAVA_OPTS` on
+macOS/Linux and the argfile on Windows).
+
+Push and pull share one `ROITOOL_TIMEOUT_SEC` (1800 s, ADR-021) and the 30 s heartbeat; the push
+script's 120 s cap is gone — at ~0.2 s per ROI it killed uploads of more than ~600 ROIs midway,
+possibly leaving a partial upload. A push timeout now says so.
+
+**Verified:** Windows, roitool 0.2.7 — export ran, connected to ICE, and its failure output was
+classified correctly.
+
+---
+
+## ADR-027 · Headless batch pull: `--id` mode, a batch file, and script-version bookkeeping
+
+**Status:** Implemented — `pull_rois_from_omero.groovy --id`; batch file kept with the project
+(`P205-.../YC-script/pull_rois_on_orion.bat`)
+
+**Context:**
+Pulling ~30 images by hand through the dialog was not practical, and calling roitool directly
+from a `.bat` reintroduces the ADR-016 hang: on a fatal error its ICE threads keep the process
+alive and the batch never moves on.
+
+**Decision:**
+- `--id <image id> --xml <out.ome.xml> [--geojson <out.geojson>]`: no image, no dialogs. Uses the
+  cached ICE host and session key and the shared runner (5 s fatal kill, timeout), creates the
+  output folders, and fails with an exception — QuPath exits 1 — with a specific message per
+  `roitoolFailure` outcome. A rejected key is also cleared from the cache.
+- `--file <in.ome.xml> [--geojson <out>]` converts an existing OME-XML without OMERO.
+- The batch file runs one QuPath per image, skips images that already have a `.geojson`, logs
+  OK/FAIL, and **stops the run** when the cached key has been cleared (every later image would
+  fail the same way). It then runs `check_roi_conversion.groovy` over the output folder (ADR-025).
+- **Bookkeeping:** each run writes `git hash-object` of the pull script to the log. In this
+  repo, `git log --all --find-object=<hash>` names the commit that produced the outputs; no
+  match means uncommitted code was used.
+
+Log in once interactively before a batch: OMERO keys expire after ~10 min idle (ADR-012 note).
+
+---
+
+*Last updated: 2026-10-24*
