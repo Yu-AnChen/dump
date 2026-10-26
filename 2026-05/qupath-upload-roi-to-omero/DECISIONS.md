@@ -901,4 +901,22 @@ Log in once interactively before a batch: OMERO keys expire after ~10 min idle (
 
 ---
 
-*Last updated: 2026-10-24*
+## ADR-028 · The session cache records its web host; another server starts fresh
+
+**Status:** Implemented in the shared `session-cache` and `credentials` blocks
+
+**Context:**
+The cache held one ICE host and key but not which server they came from. Logging in to a
+second server took the key from that server's web login, then sent it to the first server's
+cached ICE host, which rejected it — clearing the key, so every run re-prompted.
+
+**Decision:**
+The cache stores `web_host`. When the web host being logged in to differs, the cached ICE
+host and key are dropped (the username is kept as the prompt default). Caches written before
+this have no `web_host`, so they count as a different server once: a split web/ICE server
+re-prompts for its ICE host one time. Batch runs log the cached server with the script hash.
+The cache still holds **one** server: log in to the right one before a batch.
+
+---
+
+*Last updated: 2026-10-26*

@@ -110,9 +110,12 @@ if (binding.hasVariable('args') && (args as List).contains('--selftest')) {
 def credsFile   = new File(userDir, ".omero_qupath_creds")
 def cachedProps = new Properties()
 if (credsFile.exists()) credsFile.withInputStream { cachedProps.load(it) }
+// Web host the cached ICE host and key belong to; set by the credentials step (ADR-028)
+def cacheWebHost = cachedProps.getProperty("web_host", "")
 
 def saveCache = { String iceHost, String user, String key ->
     def props = new Properties()
+    props.setProperty("web_host",    cacheWebHost ?: "")
     props.setProperty("ice_host",    iceHost ?: "")
     props.setProperty("username",    user ?: "")
     props.setProperty("session_key", key ?: "")
@@ -444,6 +447,14 @@ if (!omeroHost || !imageId) {
 
 // ── Step 3: Credentials ───────────────────────────────────────────────────────
 // ==== SHARED BEGIN credentials — keep identical in push/pull scripts (check_shared.py) ====
+// The cache holds one server. On a different web host its ICE host and key are
+// not used: the key would be sent to the old server and rejected (ADR-028).
+if (cacheWebHost != omeroHost) {
+    if (cachedProps.getProperty("ice_host")) print("Cached session is for ${cacheWebHost ?: 'another server'} — not used for ${omeroHost}")
+    cachedProps.remove("ice_host")
+    cachedProps.remove("session_key")
+    cacheWebHost = omeroHost
+}
 def omeroIceHost = OMERO_ICE_HOST ?: (cachedProps.getProperty("ice_host", "") ?: omeroHost)
 print("Web: ${omeroBaseUrl}  ICE: ${omeroIceHost}:${OMERO_PORT}  Image ID: ${imageId}")
 
